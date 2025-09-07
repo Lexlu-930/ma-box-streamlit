@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 # Streamlit 版：MA + k×標準差（箱型）分析
-# 修正：相容 yfinance 對台股回傳的「多層欄位（MultiIndex）」格式，避免誤判為空而落回假資料。
+# 修正：相容 yfinance 台股多層欄位（3481 等會正確顯示），加入作者/版本資訊與固定頁尾
+# 作者: LexLu
+# 版本: v1.2 (2025-09-07)
 
 import os
 import streamlit as st
@@ -8,6 +10,12 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+from datetime import datetime
+
+# ====== 基本資訊 ======
+AUTHOR = "LexLu"
+VERSION = "v1.2 (2025-09-07)"
+YEAR = datetime.now().year
 
 # ====== 字型設定（雲端通常沒有中文字型，支援專案內 fonts/ 自帶字型）======
 try:
@@ -66,7 +74,7 @@ def parse_end_date(end_date_str: str) -> pd.Timestamp | None:
 def load_price_data(ticker: str, end_date_str: str, lookback_days: int) -> pd.DataFrame:
     """
     優先用 yfinance；成功則回傳含 CLOSE、VOLUME 欄位的 DataFrame。
-    - 兼容 yfinance 可能回傳的 MultiIndex 欄位（台股常見：第一層為價格欄位名稱，第二層為 Ticker）。
+    - 兼容 yfinance 可能回傳的 MultiIndex 欄位（台股常見）。
     - 若取不到資料，回傳假資料；並在 df.attrs['simulated'] = True 標示。
     """
     end = parse_end_date(end_date_str)
@@ -85,54 +93,28 @@ def load_price_data(ticker: str, end_date_str: str, lookback_days: int) -> pd.Da
                 progress=False,
             )
             if not df.empty:
-                # ---- 關鍵相容處理：展開可能的 MultiIndex 欄位 ----
                 close_series = None
                 volume_series = None
 
                 if isinstance(df.columns, pd.MultiIndex):
-                    # 典型台股：level 0 為 'Close'/'Volume'，level 1 為 '3481.TW' 之類的 ticker
+                    # level 0: 'Close'/'Volume', level 1: ticker
                     if "Close" in df.columns.get_level_values(0):
-                        try:
-                            close_df = df.xs("Close", axis=1, level=0, drop_level=True)
-                            # 一般會只有一個 ticker 欄，取第一欄
-                            close_series = close_df.iloc[:, 0] if isinstance(close_df, pd.DataFrame) else close_df
-                        except Exception:
-                            pass
+                        close_df = df.xs("Close", axis=1, level=0, drop_level=True)
+                        close_series = close_df.iloc[:, 0] if isinstance(close_df, pd.DataFrame) else close_df
                     if "Volume" in df.columns.get_level_values(0):
-                        try:
-                            vol_df = df.xs("Volume", axis=1, level=0, drop_level=True)
-                            volume_series = vol_df.iloc[:, 0] if isinstance(vol_df, pd.DataFrame) else vol_df
-                        except Exception:
-                            pass
-
-                    # 退一步：嘗試用 (欄位, ticker) 直接取
-                    if close_series is None:
-                        maybe = (("Close", yf_symbol),)
-                        for key in maybe:
-                            if key in df:
-                                close_series = df[key]
-                                break
-                    if volume_series is None:
-                        maybe = (("Volume", yf_symbol),)
-                        for key in maybe:
-                            if key in df:
-                                volume_series = df[key]
-                                break
-
+                        vol_df = df.xs("Volume", axis=1, level=0, drop_level=True)
+                        volume_series = vol_df.iloc[:, 0] if isinstance(vol_df, pd.DataFrame) else vol_df
                 else:
-                    # 單層欄位
                     if "Close" in df.columns:
                         close_series = df["Close"]
                     elif "Adj Close" in df.columns:
-                        close_series = df["Adj Close"]  # 作為備援
+                        close_series = df["Adj Close"]
                     else:
-                        # 若欄名不可預期，嘗試第一欄
                         close_series = df.iloc[:, 0]
 
                     if "Volume" in df.columns:
                         volume_series = df["Volume"]
                     else:
-                        # 若沒有 Volume，最後一欄當備援
                         volume_series = df.iloc[:, -1]
 
                 if close_series is not None and volume_series is not None:
@@ -140,10 +122,9 @@ def load_price_data(ticker: str, end_date_str: str, lookback_days: int) -> pd.Da
                     out.attrs["simulated"] = False
                     return out
         except Exception:
-            # 下載異常，下面用假資料
             pass
 
-    # ---- fallback：假資料（商業日）----
+    # fallback 假資料
     rng = pd.date_range(end=end, periods=lookback_days, freq="B")
     close = np.linspace(100, 110, len(rng)) + np.random.normal(0, 1.5, len(rng))
     volume = np.random.randint(1200, 3000, size=len(rng))
@@ -242,7 +223,14 @@ def analyze(df: pd.DataFrame, lookback: int, ma_win: int, vol_win: int, k: float
 
 # ================= Streamlit UI =================
 st.set_page_config(page_title="MA 規則判斷（網頁版）", layout="centered")
+
+# 標題與版本
 st.title("MA 規則判斷（網頁版）")
+st.caption(f"作者: **{AUTHOR}** ｜ 版本: **{VERSION}**")
+
+# Sidebar 關於
+st.sidebar.title("ℹ️ 關於")
+st.sidebar.markdown(f"**作者:** {AUTHOR}\n\n**版本:** {VERSION}\n\n這是一個基於 MA + k×標準差 的股票分析工具，僅空參考。")
 
 with st.form("params"):
     c1, c2 = st.columns([1, 1])
@@ -281,13 +269,12 @@ if submitted:
     if err:
         st.error(err)
     else:
-        # 若是模擬資料，給出提醒
         if df_raw.attrs.get("simulated", False):
-            st.warning("目前無法從資料源取得實際行情，以下為模擬資料（僅示範用途）。")
+            st.warning("⚠️ 注意：目前無法從資料源取得實際行情，以下為模擬資料（僅示範用途）。")
 
         st.text(report)
 
-        # ---- 圖表：收盤/MA/上下軌（含日期軸優化與中文顯示）----
+        # 圖表：收盤/MA/上下軌
         fig = plt.figure(figsize=(9.5, 4.2))
         ax = plt.gca()
         ax.plot(df_ind.index, df_ind["CLOSE"], label="收盤")
@@ -307,3 +294,40 @@ if submitted:
 
         with st.expander("查看最近 N 天原始與指標數據"):
             st.dataframe(df_ind.round(3))
+
+# ====== 固定頁尾（Footer）======
+FOOTER_HTML = f"""
+<style>
+.footer {{
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    width: 100%;
+    background: rgba(250, 250, 250, 0.92);
+    backdrop-filter: blur(6px);
+    border-top: 1px solid #e5e7eb;
+    padding: 8px 16px;
+    font-size: 12.5px;
+    color: #4b5563;
+    z-index: 9999;
+}}
+.footer .inner {{
+    max-width: 1100px;
+    margin: 0 auto;
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+}}
+@media (max-width: 600px) {{
+    .footer {{ font-size: 12px; padding: 8px 10px; }}
+    .footer .inner {{ padding-right: 62px; }} /* 避開 Streamlit 右下角圖示 */
+}}
+</style>
+<div class="footer">
+  <div class="inner">
+    <div>© {YEAR} {AUTHOR}</div>
+    <div>版本：{VERSION}</div>
+  </div>
+</div>
+"""
+st.markdown(FOOTER_HTML, unsafe_allow_html=True)
