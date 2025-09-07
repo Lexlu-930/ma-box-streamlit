@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
 # 技術指標面板（MA / 量價 / KD / MACD）+ 多股票對比 + 箱型進出說明
-# 官方備援：TWSE + TPEX（JSON 與 CSV 兩種端點），含詳細嘗試紀錄
-# 版本: v1.4.6 (2025-09-07)  作者: LexLu
+# 資料來源：yfinance(.TW / .TWO) → TWSE（上市）→ TPEX（櫃買 JSON/CSV）→ 模擬
+# v1.4.7:
+#   - 修正：不得用 `or` 連接 Series（會觸發 truth-value ambiguous）
+#   - 相對表現基準判斷改為 `pd.notna(base) and base != 0`
+#   - 其他功能同 v1.4.6
+# 作者: LexLu   日期: 2025-09-07
 
-import os, io, math, requests
+import os, io, requests
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -11,11 +15,11 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from datetime import datetime
 
-AUTHOR = "LexLu"
-VERSION = "v1.4.6 (2025-09-07)"
-YEAR = datetime.now().year
+AUTHOR  = "LexLu"
+VERSION = "v1.4.7 (2025-09-07)"
+YEAR    = datetime.now().year
 
-# ---------- 字型 ----------
+# ---------------- 字型 ----------------
 try:
     from matplotlib import font_manager
     FONT_PATH = os.path.join(os.path.dirname(__file__), "fonts", "NotoSansCJKtc-Regular.otf")
@@ -24,14 +28,13 @@ try:
         plt.rcParams["font.family"] = font_manager.FontProperties(fname=FONT_PATH).get_name()
     else:
         plt.rcParams["font.sans-serif"] = [
-            "Microsoft JhengHei", "SimHei", "PMingLiU", "Noto Sans CJK TC",
-            "PingFang TC", "PingFang SC", "WenQuanYi Zen Hei"
+            "Microsoft JhengHei","SimHei","PMingLiU","Noto Sans CJK TC","PingFang TC","WenQuanYi Zen Hei"
         ]
     plt.rcParams["axes.unicode_minus"] = False
 except Exception:
     pass
 
-# ---------- yfinance ----------
+# ---------------- yfinance ----------------
 try:
     import yfinance as yf
     HAS_YF = True
@@ -39,7 +42,7 @@ except Exception:
     HAS_YF = False
 
 
-# ---------- 小工具 ----------
+# ---------------- 小工具 ----------------
 def ensure_scalar(x):
     try:
         if isinstance(x, pd.DataFrame):
@@ -67,13 +70,13 @@ def period_start_from_choice(end_date: pd.Timestamp, choice: str) -> pd.Timestam
     return end_date - pd.Timedelta(days=90)
 
 
-# ---------- 官方來源（TWSE / TPEX） ----------
+# ---------------- 官方來源（TWSE / TPEX） ----------------
 def _tw_yyyymmdd(ts: pd.Timestamp) -> str: return ts.strftime("%Y%m%d")
 def _gregorian_to_roc_year_month(ts: pd.Timestamp) -> str: return f"{ts.year-1911}/{ts.strftime('%m')}"
 def _roc_to_gregorian(date_str: str) -> pd.Timestamp | None:
     try:
         y, m, d = date_str.split("/")
-        return pd.Timestamp(year=int(y) + 1911, month=int(m), day=int(d))
+        return pd.Timestamp(year=int(y)+1911, month=int(m), day=int(d))
     except Exception:
         return None
 
@@ -92,35 +95,33 @@ def twse_stock_day_range(stock_no: str, start: pd.Timestamp, end: pd.Timestamp) 
     for p in months:
         dt = pd.Timestamp(p.start_time)
         url = "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
-        params = {"response": "json", "date": _tw_yyyymmdd(dt), "stockNo": stock_no}
+        params = {"response":"json","date":_tw_yyyymmdd(dt),"stockNo":stock_no}
         try:
             r = requests.get(url, params=params, timeout=12, headers=COMMON_HEADERS)
             js = r.json()
             if js.get("stat") != "OK":  # 該月可能無資料
                 continue
             fields = js.get("fields", [])
-            data = js.get("data", [])
-            fidx = {name: i for i, name in enumerate(fields)}
+            data   = js.get("data", [])
+            fidx   = {name:i for i, name in enumerate(fields)}
             rows = []
             for row in data:
-                day = _roc_to_gregorian(row[fidx.get("日期", 0)])
+                day = _roc_to_gregorian(row[fidx.get("日期",0)])
                 if day is None or not (start <= day <= end): continue
                 def fnum(s):
-                    s = str(s).replace(",", "").replace("X", "").strip()
+                    s = str(s).replace(",", "").replace("X","").strip()
                     try: return float(s)
                     except: return np.nan
                 def inum(s):
                     s = str(s).replace(",", "").strip()
                     try: return int(s)
                     except: return np.nan
-                rows.append((
-                    day,
-                    fnum(row[fidx.get("開盤價", -1)]),
-                    fnum(row[fidx.get("最高價", -1)]),
-                    fnum(row[fidx.get("最低價", -1)]),
-                    fnum(row[fidx.get("收盤價", -1)]),
-                    inum(row[fidx.get("成交股數", -1)]),
-                ))
+                rows.append((day,
+                             fnum(row[fidx.get("開盤價",-1)]),
+                             fnum(row[fidx.get("最高價",-1)]),
+                             fnum(row[fidx.get("最低價",-1)]),
+                             fnum(row[fidx.get("收盤價",-1)]),
+                             inum(row[fidx.get("成交股數",-1)])))
             if rows:
                 dfs.append(pd.DataFrame(rows, columns=["DATE","OPEN","HIGH","LOW","CLOSE","VOLUME"]).set_index("DATE"))
         except Exception:
@@ -128,12 +129,11 @@ def twse_stock_day_range(stock_no: str, start: pd.Timestamp, end: pd.Timestamp) 
     return pd.concat(dfs).sort_index() if dfs else pd.DataFrame()
 
 def _tpex_json_month(stock_no: str, month_ts: pd.Timestamp) -> pd.DataFrame:
-    """TPEX JSON 端點（web/www 各試一次）"""
     endpoints = [
         "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php",
         "https://www.tpex.org.tw/www/stock/aftertrading/daily_trading_info/st43_result.php",
     ]
-    params = {"l":"zh-tw", "d": _gregorian_to_roc_year_month(month_ts), "stkno": stock_no}
+    params = {"l":"zh-tw","d":_gregorian_to_roc_year_month(month_ts),"stkno":stock_no}
     for url in endpoints:
         try:
             headers = dict(COMMON_HEADERS)
@@ -145,11 +145,10 @@ def _tpex_json_month(stock_no: str, month_ts: pd.Timestamp) -> pd.DataFrame:
                 continue
             rows = []
             for row in data:
-                # ['113/09/02','5,000','1,234,567','12.3','12.5','12.2','12.4','+0.1','123']
                 day = _roc_to_gregorian(row[0])
                 def fnum(x):
                     x = str(x).replace(",", "").replace("X","").replace("---","").strip()
-                    if x in ["", "—", "－"]: return np.nan
+                    if x in ["","—","－"]: return np.nan
                     try: return float(x)
                     except: return np.nan
                 def inum(x):
@@ -164,12 +163,11 @@ def _tpex_json_month(stock_no: str, month_ts: pd.Timestamp) -> pd.DataFrame:
     return pd.DataFrame()
 
 def _tpex_csv_month(stock_no: str, month_ts: pd.Timestamp) -> pd.DataFrame:
-    """TPEX CSV 端點（web/www），有些環境 JSON 會擋，CSV 可作備援"""
     endpoints = [
         "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_download.php",
         "https://www.tpex.org.tw/www/stock/aftertrading/daily_trading_info/st43_download.php",
     ]
-    params = {"l":"zh-tw", "d": _gregorian_to_roc_year_month(month_ts), "stkno": stock_no}
+    params = {"l":"zh-tw","d":_gregorian_to_roc_year_month(month_ts),"stkno":stock_no}
     for url in endpoints:
         try:
             headers = dict(COMMON_HEADERS)
@@ -180,30 +178,24 @@ def _tpex_csv_month(stock_no: str, month_ts: pd.Timestamp) -> pd.DataFrame:
                 df = pd.read_csv(io.BytesIO(content), encoding="utf-8-sig")
             except Exception:
                 df = pd.read_csv(io.BytesIO(content), encoding="cp950")
-            # 找欄位
-            cols = {c: i for i, c in enumerate(df.columns)}
-            # CSV 下載通常第一欄是「日期」
             if "日期" not in df.columns:
                 continue
-            out_rows = []
+            out = []
             for _, row in df.iterrows():
                 day = _roc_to_gregorian(str(row["日期"]))
                 if day is None: continue
                 def pickf(name):
-                    if name in row: s = str(row[name])
-                    else: return np.nan
-                    s = s.replace(",", "").replace("X","").replace("---","").strip()
-                    if s in ["", "—", "－"]: return np.nan
+                    s = str(row.get(name, "")).replace(",", "").replace("X","").replace("---","").strip()
+                    if s in ["","—","－"]: return np.nan
                     try: return float(s)
                     except: return np.nan
                 def picki(name):
-                    if name in row: s = str(row[name]).replace(",", "").strip()
-                    else: return np.nan
+                    s = str(row.get(name, "")).replace(",", "").strip()
                     try: return int(s)
                     except: return np.nan
-                out_rows.append((day, pickf("開盤"), pickf("最高"), pickf("最低"), pickf("收盤"), picki("成交股數")))
-            if out_rows:
-                return pd.DataFrame(out_rows, columns=["DATE","OPEN","HIGH","LOW","CLOSE","VOLUME"]).set_index("DATE")
+                out.append((day, pickf("開盤"), pickf("最高"), pickf("最低"), pickf("收盤"), picki("成交股數")))
+            if out:
+                return pd.DataFrame(out, columns=["DATE","OPEN","HIGH","LOW","CLOSE","VOLUME"]).set_index("DATE")
         except Exception:
             continue
     return pd.DataFrame()
@@ -224,7 +216,7 @@ def tpex_stock_day_range(stock_no: str, start: pd.Timestamp, end: pd.Timestamp) 
     return pd.concat(dfs).sort_index() if dfs else pd.DataFrame()
 
 
-# ---------- yfinance 多層欄位處理 ----------
+# ---------------- yfinance 多層欄位處理 ----------------
 def _pick_series_any_level(df: pd.DataFrame, name: str, preferred_symbol: str | None = None):
     if isinstance(df.columns, pd.MultiIndex):
         for level in range(df.columns.nlevels):
@@ -239,43 +231,59 @@ def _pick_series_any_level(df: pd.DataFrame, name: str, preferred_symbol: str | 
     return df[name] if name in df.columns else None
 
 
+# ---------------- 資料載入（重要修正） ----------------
 @st.cache_data(show_spinner=False)
 def load_price_data(ticker: str, end_date_str: str, lookback_days: int) -> pd.DataFrame:
-    """yfinance(.TW→.TWO) → TWSE → TPEX → 模擬；附 attempts 除錯資訊"""
+    """
+    順序：yfinance(.TW→.TWO) → TWSE → TPEX → 模擬
+    所有嘗試記錄寫入 df.attrs['attempts']
+    """
     attempts = []
     end = parse_end_date(end_date_str)
     if end is None: return pd.DataFrame()
-    start = end - pd.Timedelta(days=max(lookback_days * 2, 120))
+    start = end - pd.Timedelta(days=max(lookback_days*2, 120))
 
     # 1) yfinance
     if HAS_YF:
         symbols = [ticker] if not ticker.isdigit() else [f"{ticker}.TW", f"{ticker}.TWO"]
         for sym in symbols:
             try:
-                df = yf.download(sym, start=start.strftime("%Y-%m-%d"),
+                df = yf.download(sym,
+                                 start=start.strftime("%Y-%m-%d"),
                                  end=(end + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
                                  progress=False, auto_adjust=True)
                 if df is None or df.empty:
-                    attempts.append(f"yfinance({sym}): empty"); continue
-                close_s = _pick_series_any_level(df, "Close", preferred_symbol=sym) \
-                          or _pick_series_any_level(df, "Adj Close", preferred_symbol=sym)
-                vol_s   = _pick_series_any_level(df, "Volume", preferred_symbol=sym)
-                open_s  = _pick_series_any_level(df, "Open", preferred_symbol=sym)
-                high_s  = _pick_series_any_level(df, "High", preferred_symbol=sym)
-                low_s   = _pick_series_any_level(df, "Low",  preferred_symbol=sym)
+                    attempts.append(f"yfinance({sym}): empty")
+                    continue
+
+                # ❗不能用 `or` 連接 Series，必須分開寫
+                close_s = _pick_series_any_level(df, "Close", preferred_symbol=sym)
+                if close_s is None:
+                    close_s = _pick_series_any_level(df, "Adj Close", preferred_symbol=sym)
+                vol_s = _pick_series_any_level(df, "Volume", preferred_symbol=sym)
+                open_s = _pick_series_any_level(df, "Open", preferred_symbol=sym)
+                high_s = _pick_series_any_level(df, "High", preferred_symbol=sym)
+                low_s  = _pick_series_any_level(df, "Low",  preferred_symbol=sym)
+
                 if close_s is None or vol_s is None:
-                    attempts.append(f"yfinance({sym}): missing Close/Volume"); continue
+                    attempts.append(f"yfinance({sym}): missing Close/Volume")
+                    continue
+
                 out = pd.DataFrame({
                     "OPEN": open_s if open_s is not None else np.nan,
                     "HIGH": high_s if high_s is not None else np.nan,
                     "LOW":  low_s  if low_s  is not None else np.nan,
-                    "CLOSE": close_s, "VOLUME": vol_s,
+                    "CLOSE": close_s,
+                    "VOLUME": vol_s,
                 }).dropna(subset=["CLOSE"])
+
                 if out.empty:
-                    attempts.append(f"yfinance({sym}): parsed empty"); continue
+                    attempts.append(f"yfinance({sym}): parsed empty")
+                    continue
+
                 out.attrs["simulated"] = False
-                out.attrs["source"] = f"yfinance({sym})"
-                out.attrs["attempts"] = attempts
+                out.attrs["source"]    = f"yfinance({sym})"
+                out.attrs["attempts"]  = attempts
                 return out
             except Exception as e:
                 attempts.append(f"yfinance({sym}) error: {type(e).__name__}: {str(e)[:120]}")
@@ -285,9 +293,9 @@ def load_price_data(ticker: str, end_date_str: str, lookback_days: int) -> pd.Da
         tw = twse_stock_day_range(ticker, start, end)
         if not tw.empty:
             tw.attrs["simulated"] = False
-            tw.attrs["source"] = "twse"
+            tw.attrs["source"]    = "twse"
             attempts.append(f"twse: ok rows={len(tw)}")
-            tw.attrs["attempts"] = attempts
+            tw.attrs["attempts"]  = attempts
             return tw
         attempts.append("twse: empty")
 
@@ -296,27 +304,27 @@ def load_price_data(ticker: str, end_date_str: str, lookback_days: int) -> pd.Da
         tp = tpex_stock_day_range(ticker, start, end)
         if not tp.empty:
             tp.attrs["simulated"] = False
-            tp.attrs["source"] = "tpex"
+            tp.attrs["source"]    = "tpex"
             attempts.append(f"tpex: ok rows={len(tp)}")
-            tp.attrs["attempts"] = attempts
+            tp.attrs["attempts"]  = attempts
             return tp
         attempts.append("tpex: empty")
 
     # 4) 模擬
     rng = pd.date_range(end=end, periods=lookback_days, freq="B")
-    close = np.linspace(100, 110, len(rng)) + np.random.normal(0, 1.5, len(rng))
-    openp = close + np.random.normal(0, 0.6, len(rng))
-    high  = np.maximum(openp, close) + np.random.uniform(0.1, 0.8, len(rng))
-    low   = np.minimum(openp, close) - np.random.uniform(0.1, 0.8, len(rng))
+    close  = np.linspace(100, 110, len(rng)) + np.random.normal(0, 1.5, len(rng))
+    openp  = close + np.random.normal(0, 0.6, len(rng))
+    high   = np.maximum(openp, close) + np.random.uniform(0.1, 0.8, len(rng))
+    low    = np.minimum(openp, close) - np.random.uniform(0.1, 0.8, len(rng))
     volume = np.random.randint(1200, 3000, size=len(rng))
     demo = pd.DataFrame({"OPEN": openp,"HIGH":high,"LOW":low,"CLOSE":close,"VOLUME":volume}, index=rng)
     demo.attrs["simulated"] = True
-    demo.attrs["source"] = "simulated"
-    demo.attrs["attempts"] = attempts
+    demo.attrs["source"]    = "simulated"
+    demo.attrs["attempts"]  = attempts
     return demo
 
 
-# ---------- 技術指標 ----------
+# ---------------- 指標 ----------------
 def add_mas(df: pd.DataFrame, windows: list[int]) -> pd.DataFrame:
     for w in windows: df[f"MA{w}"] = df["CLOSE"].rolling(w).mean()
     return df
@@ -325,59 +333,74 @@ def add_vol_ma(df: pd.DataFrame, vol_win: int) -> pd.DataFrame:
     df["VOL_MA"] = df["VOLUME"].rolling(vol_win).mean(); return df
 
 def add_boll(df: pd.DataFrame, boll_win: int = 20, k: float = 2.0) -> pd.DataFrame:
-    ma = df["CLOSE"].rolling(boll_win).mean()
+    ma  = df["CLOSE"].rolling(boll_win).mean()
     std = df["CLOSE"].rolling(boll_win).std(ddof=0)
-    df["BOLL_MA"] = ma; df["BOLL_UPPER"] = ma + k*std; df["BOLL_LOWER"] = ma - k*std
+    df["BOLL_MA"]    = ma
+    df["BOLL_UPPER"] = ma + k*std
+    df["BOLL_LOWER"] = ma - k*std
     return df
 
 def add_kd(df: pd.DataFrame, n: int = 9, k_smooth: int = 3, d_smooth: int = 3) -> pd.DataFrame:
-    low_n = df["LOW"].rolling(n).min(); high_n = df["HIGH"].rolling(n).max()
+    low_n  = df["LOW"].rolling(n).min()
+    high_n = df["HIGH"].rolling(n).max()
     rsv = 100*(df["CLOSE"]-low_n) / (high_n-low_n).replace(0, np.nan)
-    k = rsv.rolling(k_smooth).mean(); d = k.rolling(d_smooth).mean()
-    df["%K"] = k; df["%D"] = d; return df
+    k = rsv.rolling(k_smooth).mean()
+    d = k.rolling(d_smooth).mean()
+    df["%K"] = k; df["%D"] = d
+    return df
 
 def add_macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
     ema_fast = df["CLOSE"].ewm(span=fast, adjust=False).mean()
     ema_slow = df["CLOSE"].ewm(span=slow, adjust=False).mean()
     macd = ema_fast - ema_slow
-    macd_signal = macd.ewm(span=signal, adjust=False).mean()
-    df["MACD"] = macd; df["MACD_SIGNAL"] = macd_signal; df["MACD_HIST"] = macd - macd_signal
+    sig  = macd.ewm(span=signal, adjust=False).mean()
+    df["MACD"] = macd; df["MACD_SIGNAL"] = sig; df["MACD_HIST"] = macd - sig
     return df
 
 def analyze_core(df: pd.DataFrame, vol_filter: bool, vol_win: int, k_boll: float, boll_win: int):
-    df = df.copy(); df = add_vol_ma(df, vol_win); df = add_boll(df, boll_win, k_boll)
+    df = df.copy()
+    df = add_vol_ma(df, vol_win)
+    df = add_boll(df, boll_win, k_boll)
     last = df.iloc[-1]
-    close = ensure_scalar(last["CLOSE"]); ma = ensure_scalar(df["BOLL_MA"].iloc[-1])
-    std = ensure_scalar((df["BOLL_UPPER"].iloc[-1]-df["BOLL_MA"].iloc[-1]) / (k_boll or np.nan))
-    vol = ensure_scalar(last["VOLUME"]); volma = ensure_scalar(last["VOL_MA"])
-    upper = ensure_scalar(last["BOLL_UPPER"]); lower = ensure_scalar(last["BOLL_LOWER"])
+    close = ensure_scalar(last["CLOSE"])
+    ma    = ensure_scalar(df["BOLL_MA"].iloc[-1])
+    std   = ensure_scalar((df["BOLL_UPPER"].iloc[-1]-df["BOLL_MA"].iloc[-1]) / (k_boll or np.nan))
+    vol   = ensure_scalar(last["VOLUME"])
+    volma = ensure_scalar(last["VOL_MA"])
+    upper = ensure_scalar(last["BOLL_UPPER"])
+    lower = ensure_scalar(last["BOLL_LOWER"])
     vol_ok=True; vol_msg=""
     if vol_filter:
         if pd.notna(vol) and pd.notna(volma):
-            vol_ok = vol >= volma
+            vol_ok = (vol >= volma)
             if not vol_ok: vol_msg = "量能不足（最後一日 < 量均）"
         else:
             vol_ok=False; vol_msg="量能資料不足，無法判斷"
     pos="N/A"
     if pd.notna(close) and pd.notna(ma) and pd.notna(upper):
-        if close<ma: pos="低於中軌"
-        elif close>=upper: pos="接近/高於上軌"
+        if close < ma: pos="低於中軌"
+        elif close >= upper: pos="接近/高於上軌"
         else: pos="介於中軌與上軌"
     return df, dict(close=close, ma=ma, std=std, vol=vol, volma=volma,
                     upper=upper, lower=lower, vol_ok=vol_ok, vol_msg=vol_msg, pos=pos)
 
 def detect_cross(x: pd.Series, y: pd.Series):
-    x=x.astype(float); y=y.astype(float)
-    prev=(x.shift(1)-y.shift(1)); now=(x-y)
-    gold=(prev<=0)&(now>0); death=(prev>=0)&(now<0)
+    x = x.astype(float); y = y.astype(float)
+    prev = (x.shift(1) - y.shift(1))
+    now  = (x - y)
+    gold  = (prev <= 0) & (now > 0)
+    death = (prev >= 0) & (now < 0)
     return x.index[gold.fillna(False)], x.index[death.fillna(False)]
 
-def make_csv_bytes(df: pd.DataFrame) -> bytes: return df.to_csv(index=True).encode("utf-8-sig")
+def make_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=True).encode("utf-8-sig")
+
 def make_excel_bytes(df: pd.DataFrame) -> bytes | None:
     try:
         import openpyxl  # noqa
-        bio=io.BytesIO()
-        with pd.ExcelWriter(bio, engine="openpyxl") as w: df.to_excel(w, sheet_name="sheet1")
+        bio = io.BytesIO()
+        with pd.ExcelWriter(bio, engine="openpyxl") as w:
+            df.to_excel(w, sheet_name="sheet1")
         bio.seek(0); return bio.read()
     except Exception:
         return None
@@ -385,7 +408,7 @@ def make_excel_bytes(df: pd.DataFrame) -> bytes | None:
 def build_box_report(m: dict, use_vol_filter: bool, cost: float | None, tp_pct: float | None, sl_pct: float | None) -> str:
     close, ma, upper, lower = m["close"], m["ma"], m["upper"], m["lower"]
     vol, volma, vol_ok, vol_msg = m["vol"], m["volma"], m["vol_ok"], m.get("vol_msg","")
-    lines=[
+    lines = [
         "— 當日數據 / 計算結果 —",
         f"收盤價: {close:.2f}" if pd.notna(close) else "收盤價: N/A",
         f"日線均價(MA) = 建議買價: {ma:.2f}" if pd.notna(ma) else "日線均價(MA) = 建議買價: N/A",
@@ -413,7 +436,7 @@ def build_box_report(m: dict, use_vol_filter: bool, cost: float | None, tp_pct: 
     return "\n".join(lines)
 
 
-# ---------- Streamlit UI ----------
+# ---------------- Streamlit UI ----------------
 st.set_page_config(page_title="技術指標面板（含多股票對比）", layout="wide")
 st.title("技術指標面板（MA / 量價 / KD / MACD）")
 st.caption(f"作者: **{AUTHOR}** ｜ 版本: **{VERSION}**")
@@ -451,7 +474,6 @@ with st.form("params"):
         cost_str   = st.text_input("持有成本（可留空）", value="")
         tp_pct     = st.number_input("停利(%)", value=8.0, step=0.5)
         sl_pct     = st.number_input("停損(%)", value=5.0, step=0.5)
-
     submitted = st.form_submit_button("開始分析")
 
 if not submitted:
@@ -470,13 +492,13 @@ except Exception:
 cost_val = ensure_scalar(cost_str) if cost_str.strip() else np.nan
 cost_for_report = cost_val if pd.notna(cost_val) else None
 
-# 下載 + 指標
+# 下載 + 計算
 results = {}
 for tk in tickers:
     df_raw = load_price_data(tk, end_dt_str, int(lookback))
     if df_raw.empty: continue
     df_proc, metrics = analyze_core(df=df_raw, vol_filter=vol_filter, vol_win=int(vol_win), k_boll=float(k_boll), boll_win=int(boll_win))
-    df_proc = add_mas(df_proc, ma_windows + [5,20])
+    df_proc = add_mas(df_proc, ma_windows + [5,20])  # 確保 MA5/MA20
     df_proc = add_kd(df_proc, n=9, k_smooth=3, d_smooth=3)
     df_proc = add_macd(df_proc, fast=int(macd_fast), slow=int(macd_slow), signal=int(macd_signal))
     vol_pass = (df_proc["VOLUME"] >= df_proc["VOL_MA"]).tail(int(lookback)).sum()
@@ -508,19 +530,19 @@ for tk,r in results.items():
 st.subheader("多股票排名表（近 N 天）")
 st.dataframe(pd.DataFrame(rows))
 
-# 相對表現
+# 相對表現（修正真值測試）
 st.subheader(f"多股票相對表現（{compare_period}）")
-end_dt = parse_end_date(end_dt_str) or pd.Timestamp.today().normalize()
-start_cmp = period_start_from_choice(end_dt, compare_period)
+end_dt   = parse_end_date(end_dt_str) or pd.Timestamp.today().normalize()
+start_cmp= period_start_from_choice(end_dt, compare_period)
 figC = plt.figure(figsize=(11,4.2)); axC = plt.gca()
 for tk,r in results.items():
-    ser=r["df"].loc[start_cmp:end_dt]["CLOSE"].dropna()
+    ser = r["df"].loc[start_cmp:end_dt]["CLOSE"].dropna()
     if ser.empty: continue
-    base=ser.iloc[0]
-    if base and not np.isnan(base) and base!=0:
-        axC.plot(ser.index, ser/base*100.0, label=tk)
+    base = ser.iloc[0]
+    if pd.notna(base) and base != 0:
+        axC.plot(ser.index, ser / base * 100.0, label=tk)
 axC.legend(); axC.set_ylabel("相對表現（基準=100）"); axC.set_title("相對表現對比")
-locator=mdates.AutoDateLocator(); formatter=mdates.ConciseDateFormatter(locator)
+locator = mdates.AutoDateLocator(); formatter = mdates.ConciseDateFormatter(locator)
 axC.xaxis.set_major_locator(locator); axC.xaxis.set_major_formatter(formatter)
 figC.autofmt_xdate(rotation=45)
 st.pyplot(figC, clear_figure=True)
@@ -539,14 +561,14 @@ for i,tk in enumerate(tickers):
                 with st.expander("資料來源嘗試紀錄（debug）"):
                     st.write("\n".join(r["attempts"]))
 
-        c1,c2,c3,c4=st.columns(4)
+        c1,c2,c3,c4 = st.columns(4)
         c1.metric("收盤價", f"{m['close']:.2f}" if pd.notna(m['close']) else "N/A")
         c2.metric("中軌MA(=建議買價)", f"{m['ma']:.2f}" if pd.notna(m['ma']) else "N/A")
         c3.metric("上軌(=建議賣價)", f"{m['upper']:.2f}" if pd.notna(m['upper']) else "N/A")
         c4.metric("下靶(箱型下限)", f"{m['lower']:.2f}" if pd.notna(m['lower']) else "N/A")
         st.text(build_box_report(m, vol_filter, cost_for_report, tp_pct, sl_pct))
 
-        fig1=plt.figure(figsize=(10.8,4.2)); ax1=plt.gca()
+        fig1 = plt.figure(figsize=(10.8,4.2)); ax1 = plt.gca()
         ax1.plot(dfp.index, dfp["CLOSE"], label="收盤")
         for w in ma_windows:
             col=f"MA{w}"
@@ -561,7 +583,7 @@ for i,tk in enumerate(tickers):
         ax1.xaxis.set_major_locator(locator); ax1.xaxis.set_major_formatter(formatter)
         fig1.autofmt_xdate(rotation=45); st.pyplot(fig1, clear_figure=True)
 
-        fig2=plt.figure(figsize=(10.8,2.8)); ax2=plt.gca()
+        fig2 = plt.figure(figsize=(10.8,2.8)); ax2 = plt.gca()
         ax2.bar(dfp.index, dfp["VOLUME"], width=0.8, label="成交量")
         if "VOL_MA" in dfp: ax2.plot(dfp.index, dfp["VOL_MA"], label=f"量均({int(vol_win)})")
         ax2.legend(); ax2.set_title("量價（成交量與量均）")
@@ -603,18 +625,15 @@ for i,tk in enumerate(tickers):
         with st.expander("原始＋指標資料（完整）"):
             st.dataframe(dfp.round(4))
 
-# Footer
+# ---------------- Footer ----------------
 FOOTER_HTML = f"""
 <style>
-.footer {{
-  position: fixed; left: 0; right: 0; bottom: 0; width: 100%;
-  background: rgba(250,250,250,.92); backdrop-filter: blur(6px);
-  border-top: 1px solid #e5e7eb; padding: 8px 16px; font-size: 12.5px;
-  color: #4b5563; z-index: 9999;
-}}
-.footer .inner {{ max-width: 1200px; margin: 0 auto; display: flex;
-  justify-content: space-between; gap: 12px; flex-wrap: wrap; }}
-@media (max-width: 600px) {{ .footer {{ font-size: 12px; padding: 8px 10px; }} }}
+.footer {{ position: fixed; left:0; right:0; bottom:0; width:100%;
+  background: rgba(250,250,250,.92); border-top:1px solid #e5e7eb;
+  padding:8px 16px; font-size:12.5px; color:#4b5563; z-index:9999; }}
+.footer .inner {{ max-width:1200px; margin:0 auto; display:flex; justify-content:space-between;
+  gap:12px; flex-wrap:wrap; }}
+@media (max-width:600px) {{ .footer {{ font-size:12px; padding:8px 10px; }} }}
 </style>
 <div class="footer"><div class="inner">
   <div>© {YEAR} {AUTHOR}</div><div>版本：{VERSION}</div>
