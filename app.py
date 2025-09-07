@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 # 技術指標面板（MA / 量價 / KD / MACD）+ 多股票對比 + 箱型進出說明 + 中文名稱（可顯示簡短）
-# v1.5.2:
-#   - 相對表現對比：繪圖前檢查各檔有效點數(<2則不畫)，並在下方列出原因
-#   - 相對表現線條加粗、採用各檔期間內第一筆有效價做基準
-#   - 其餘沿用 v1.5.1（名稱來源：TWSE codeQuery→ISIN→yfinance；備援資料源；修正 Series 真值判定）
+# v1.5.3:
+#   - 修正：避免以 `or` 串接 Pandas Series（會觸發「Series 真值不明確」），改用顯式 None 檢查
+#   - 其他功能沿用：名稱來源（TWSE codeQuery→ISIN→yfinance）、TWSE/TPEX 備援、相對表現檢查、下載報表等
 # 作者: LexLu   日期: 2025-09-07
 
 import os, io, re, requests
@@ -15,7 +14,7 @@ import matplotlib.dates as mdates
 from datetime import datetime
 
 AUTHOR  = "LexLu"
-VERSION = "v1.5.2 (2025-09-07)"
+VERSION = "v1.5.3 (2025-09-07)"
 YEAR    = datetime.now().year
 
 # ===== 字型 =====
@@ -291,7 +290,7 @@ def simplify_ch_name(name: str) -> str:
             break
     return name.replace(" ","")
 
-# ===== 載入價格資料 =====
+# ===== 載入價格資料（修正 Series 真值判定） =====
 @st.cache_data(show_spinner=False)
 def load_price_data(ticker: str, end_date_str: str, lookback_days: int) -> pd.DataFrame:
     attempts=[]
@@ -308,19 +307,31 @@ def load_price_data(ticker: str, end_date_str: str, lookback_days: int) -> pd.Da
                                  progress=False, auto_adjust=True)
                 if df is None or df.empty:
                     attempts.append(f"yfinance({sym}): empty"); continue
-                close_s = _pick_series_any_level(df,"Close",preferred_symbol=sym) or _pick_series_any_level(df,"Adj Close",preferred_symbol=sym)
-                vol_s   = _pick_series_any_level(df,"Volume",preferred_symbol=sym)
-                open_s  = _pick_series_any_level(df,"Open",preferred_symbol=sym)
-                high_s  = _pick_series_any_level(df,"High",preferred_symbol=sym)
-                low_s   = _pick_series_any_level(df,"Low",preferred_symbol=sym)
+
+                # 這裡不能用 `or`，否則會對 Series 做真假判斷而報錯
+                close_s = _pick_series_any_level(df, "Close", preferred_symbol=sym)
+                if close_s is None:
+                    close_s = _pick_series_any_level(df, "Adj Close", preferred_symbol=sym)
+
+                vol_s   = _pick_series_any_level(df, "Volume", preferred_symbol=sym)
+                open_s  = _pick_series_any_level(df, "Open", preferred_symbol=sym)
+                high_s  = _pick_series_any_level(df, "High", preferred_symbol=sym)
+                low_s   = _pick_series_any_level(df, "Low",  preferred_symbol=sym)
+
                 if close_s is None or vol_s is None:
                     attempts.append(f"yfinance({sym}): missing Close/Volume"); continue
-                out = pd.DataFrame({"OPEN": open_s if open_s is not None else np.nan,
-                                    "HIGH": high_s if high_s is not None else np.nan,
-                                    "LOW":  low_s  if low_s  is not None else np.nan,
-                                    "CLOSE": close_s, "VOLUME": vol_s}).dropna(subset=["CLOSE"])
+
+                out = pd.DataFrame({
+                    "OPEN": open_s if open_s is not None else np.nan,
+                    "HIGH": high_s if high_s is not None else np.nan,
+                    "LOW":  low_s  if low_s  is not None else np.nan,
+                    "CLOSE": close_s,
+                    "VOLUME": vol_s,
+                }).dropna(subset=["CLOSE"])
+
                 if out.empty:
                     attempts.append(f"yfinance({sym}): parsed empty"); continue
+
                 out.attrs["simulated"]=False; out.attrs["source"]=f"yfinance({sym})"; out.attrs["attempts"]=attempts
                 return out
             except Exception as e:
@@ -466,6 +477,9 @@ except Exception:
     ma_windows = [5,10,20,60]
 
 raw_name_map = {tk: get_stock_name_raw(tk) for tk in tickers}
+def is_ascii(s: str) -> bool:
+    try: s.encode("ascii"); return True
+    except Exception: return False
 def show_name(n: str) -> str:
     if name_mode == "完整": return n
     if not n or is_ascii(n): return n
@@ -514,7 +528,7 @@ for tk,r in results.items():
 st.subheader("多股票排名表（近 N 天）")
 st.dataframe(pd.DataFrame(rows))
 
-# 相對表現（新版：檢查有效筆數、顯示原因）
+# 相對表現（含資料檢查）
 st.subheader(f"多股票相對表現（{compare_period}）")
 end_dt = parse_end_date(end_dt_str) or pd.Timestamp.today().normalize()
 start_cmp = period_start_from_choice(end_dt, compare_period)
@@ -526,16 +540,13 @@ missing_info = []
 for tk,r in results.items():
     s_close = r["df"].loc[start_cmp:end_dt]["CLOSE"].astype(float)
     s_valid = s_close.dropna()
-
     if len(s_valid) < 2:
         missing_info.append(f"{tk} {r.get('name','')}：期間內有效資料 {len(s_valid)} 筆，未繪製")
         continue
-
     base = s_valid.iloc[0]
     if pd.isna(base) or base == 0:
         missing_info.append(f"{tk} {r.get('name','')}：基準價無效（{base}）")
         continue
-
     norm = s_valid / base * 100.0
     axC.plot(norm.index, norm.values, label=f"{tk} {r.get('name','')}".strip(), linewidth=2)
 
