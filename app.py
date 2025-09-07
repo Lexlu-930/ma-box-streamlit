@@ -1,16 +1,11 @@
 # -*- coding: utf-8 -*-
-# 技術指標面板（MA / 量價 / KD / MACD）+ 多股票對比 + 箱型進出說明
-# 新增 (v1.4.3):
-#  - 個股分頁加入「當日數據／計算結果」文字說明（MA=建議買價、上軌=建議賣價、下軌、量能過濾）
-#  - 可選填「持有成本/停利(%)/停損(%)」，顯示「依成本計算」（目前損益%、停利價/停損價）
-# 保留:
-#  - 相對表現期間切換（近1月 / 近3月 / 近半年 / YTD）
-#  - 黃金交叉/死亡交叉（MA5×MA20、MACD×Signal）標註
-#  - 下載 CSV / Excel
-#  - yfinance 失敗自動 TWSE 備援
-#  - 多股票排名表（近N天報酬、波動、量能達標次數）
+# 技術指標面板（MA / 量價 / KD / MACD）+ 多股票對比 + 箱型進出說明 + 官方備援(TWSE/TPEX)
+# 變更 (v1.4.4):
+#  - yfinance 自動嘗試 .TW 與 .TWO
+#  - 新增 TPEX(櫃買) 備援，TWSE 取不到時改抓 TPEX
+#  - 其餘功能沿用 v1.4.3：相對表現期間、交叉標註、下載、箱型說明、排名表
 # 作者: LexLu
-# 版本: v1.4.3 (2025-09-07)
+# 版本: v1.4.4 (2025-09-07)
 
 import os
 import io
@@ -24,7 +19,7 @@ from datetime import datetime
 
 # ====== 基本資訊 ======
 AUTHOR = "LexLu"
-VERSION = "v1.4.3 (2025-09-07)"
+VERSION = "v1.4.4 (2025-09-07)"
 YEAR = datetime.now().year
 
 # ====== 字型設定 ======
@@ -43,7 +38,7 @@ try:
 except Exception:
     pass
 
-# ====== yfinance ======
+# ====== yfinance（可用則嘗試 .TW/.TWO）======
 try:
     import yfinance as yf
     HAS_YF = True
@@ -85,11 +80,12 @@ def period_start_from_choice(end_date: pd.Timestamp, choice: str) -> pd.Timestam
     return end_date - pd.Timedelta(days=90)
 
 
-# ====== TWSE 備援 ======
+# ====== TWSE / TPEX 官方備援 ======
 def _tw_yyyymmdd(ts: pd.Timestamp) -> str:
     return ts.strftime("%Y%m%d")
 
 def _roc_to_gregorian(date_str: str) -> pd.Timestamp | None:
+    # '113/09/02' -> 2024-09-02
     try:
         y, m, d = date_str.split("/")
         year = int(y) + 1911
@@ -97,8 +93,14 @@ def _roc_to_gregorian(date_str: str) -> pd.Timestamp | None:
     except Exception:
         return None
 
+def _gregorian_to_roc_year_month(ts: pd.Timestamp) -> str:
+    # 給 TPEX 用：'113/09'
+    roc_y = ts.year - 1911
+    return f"{roc_y}/{ts.strftime('%m')}"
+
 @st.cache_data(show_spinner=False)
 def twse_stock_day_range(stock_no: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    """TWSE 上市：按月抓 ST0CK_DAY，整併成區間 OHLCV"""
     dfs = []
     months = pd.period_range(start=start, end=end, freq="M")
     if len(months) == 0:
@@ -110,7 +112,7 @@ def twse_stock_day_range(stock_no: str, start: pd.Timestamp, end: pd.Timestamp) 
         try:
             r = requests.get(url, params=params, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
             js = r.json()
-            if js.get("stat") != "OK":
+            if js.get("stat") != "OK":  # 非 OK 略過
                 continue
             fields = js.get("fields", [])
             data = js.get("data", [])
@@ -143,6 +145,54 @@ def twse_stock_day_range(stock_no: str, start: pd.Timestamp, end: pd.Timestamp) 
         return pd.DataFrame()
     return pd.concat(dfs).sort_index()
 
+@st.cache_data(show_spinner=False)
+def tpex_stock_day_range(stock_no: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    """
+    TPEX(櫃買) 櫃檯買賣中心：st43_result.php（按月）
+    典型欄位順序: 日期, 成交股數, 成交金額, 開盤, 最高, 最低, 收盤, 漲跌, 成交筆數
+    """
+    dfs = []
+    months = pd.period_range(start=start, end=end, freq="M")
+    if len(months) == 0:
+        months = pd.period_range(start=start, end=end + pd.Timedelta(days=1), freq="M")
+    for p in months:
+        dt = pd.Timestamp(p.start_time)
+        url = "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php"
+        params = {"l": "zh-tw", "d": _gregorian_to_roc_year_month(dt), "stkno": stock_no}
+        try:
+            r = requests.get(url, params=params, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+            js = r.json()
+            data = js.get("aaData") or js.get("data") or []
+            rows = []
+            for row in data:
+                # row 例子：['113/09/02','5,000','1,234,567','12.3','12.5','12.2','12.4','+0.1','123']
+                dt_ = _roc_to_gregorian(row[0])
+                if dt_ is None or not (start <= dt_ <= end):
+                    continue
+                def to_float(s):
+                    s = str(s).replace(",", "").replace("X", "").replace("---", "").strip()
+                    if s in ["", "—", "－"]: return np.nan
+                    try: return float(s)
+                    except: return np.nan
+                def to_int(s):
+                    s = str(s).replace(",", "").strip()
+                    try: return int(s)
+                    except: return np.nan
+                openp = to_float(row[3]) if len(row) > 3 else np.nan
+                high  = to_float(row[4]) if len(row) > 4 else np.nan
+                low   = to_float(row[5]) if len(row) > 5 else np.nan
+                close = to_float(row[6]) if len(row) > 6 else np.nan
+                volume = to_int(row[1]) if len(row) > 1 else np.nan
+                rows.append((dt_, openp, high, low, close, volume))
+            if rows:
+                dfm = pd.DataFrame(rows, columns=["DATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"]).set_index("DATE")
+                dfs.append(dfm)
+        except Exception:
+            continue
+    if not dfs:
+        return pd.DataFrame()
+    return pd.concat(dfs).sort_index()
+
 
 # ====== yfinance 多層欄位處理 ======
 def _pick_series_any_level(df: pd.DataFrame, name: str, preferred_symbol: str | None = None):
@@ -163,44 +213,48 @@ def _pick_series_any_level(df: pd.DataFrame, name: str, preferred_symbol: str | 
 
 @st.cache_data(show_spinner=False)
 def load_price_data(ticker: str, end_date_str: str, lookback_days: int) -> pd.DataFrame:
+    """優先 yfinance(.TW/.TWO) → TWSE → TPEX → 模擬"""
     end = parse_end_date(end_date_str)
     if end is None:
         return pd.DataFrame()
     start = end - pd.Timedelta(days=max(lookback_days * 2, 120))
-    yf_symbol = f"{ticker}.TW" if ticker.isdigit() else ticker
 
-    # 1) yfinance
+    # 1) yfinance（若為數字代碼，依序試 .TW → .TWO）
+    tried_symbols = []
     if HAS_YF:
-        try:
-            df = yf.download(
-                yf_symbol,
-                start=start.strftime("%Y-%m-%d"),
-                end=(end + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
-                progress=False,
-                auto_adjust=True,
-            )
-            if not df.empty:
-                close_s = _pick_series_any_level(df, "Close", preferred_symbol=yf_symbol) \
-                          or _pick_series_any_level(df, "Adj Close", preferred_symbol=yf_symbol)
-                vol_s = _pick_series_any_level(df, "Volume", preferred_symbol=yf_symbol)
-                open_s = _pick_series_any_level(df, "Open", preferred_symbol=yf_symbol)
-                high_s = _pick_series_any_level(df, "High", preferred_symbol=yf_symbol)
-                low_s  = _pick_series_any_level(df, "Low",  preferred_symbol=yf_symbol)
-                if close_s is not None and vol_s is not None:
-                    out = pd.DataFrame({
-                        "OPEN": open_s if open_s is not None else np.nan,
-                        "HIGH": high_s if high_s is not None else np.nan,
-                        "LOW":  low_s  if low_s  is not None else np.nan,
-                        "CLOSE": close_s,
-                        "VOLUME": vol_s,
-                    }).dropna(subset=["CLOSE"])
-                    out.attrs["simulated"] = False
-                    out.attrs["source"] = "yfinance"
-                    return out
-        except Exception:
-            pass
+        symbols = [ticker] if not ticker.isdigit() else [f"{ticker}.TW", f"{ticker}.TWO"]
+        for yf_symbol in symbols:
+            tried_symbols.append(yf_symbol)
+            try:
+                df = yf.download(
+                    yf_symbol,
+                    start=start.strftime("%Y-%m-%d"),
+                    end=(end + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+                    progress=False,
+                    auto_adjust=True,
+                )
+                if not df.empty:
+                    close_s = _pick_series_any_level(df, "Close", preferred_symbol=yf_symbol) \
+                              or _pick_series_any_level(df, "Adj Close", preferred_symbol=yf_symbol)
+                    vol_s = _pick_series_any_level(df, "Volume", preferred_symbol=yf_symbol)
+                    open_s = _pick_series_any_level(df, "Open", preferred_symbol=yf_symbol)
+                    high_s = _pick_series_any_level(df, "High", preferred_symbol=yf_symbol)
+                    low_s  = _pick_series_any_level(df, "Low",  preferred_symbol=yf_symbol)
+                    if close_s is not None and vol_s is not None:
+                        out = pd.DataFrame({
+                            "OPEN": open_s if open_s is not None else np.nan,
+                            "HIGH": high_s if high_s is not None else np.nan,
+                            "LOW":  low_s  if low_s  is not None else np.nan,
+                            "CLOSE": close_s,
+                            "VOLUME": vol_s,
+                        }).dropna(subset=["CLOSE"])
+                        out.attrs["simulated"] = False
+                        out.attrs["source"] = f"yfinance({yf_symbol})"
+                        return out
+            except Exception:
+                continue
 
-    # 2) TWSE 備援
+    # 2) TWSE（上市）
     if ticker.isdigit():
         tw = twse_stock_day_range(ticker, start, end)
         if not tw.empty:
@@ -208,7 +262,15 @@ def load_price_data(ticker: str, end_date_str: str, lookback_days: int) -> pd.Da
             tw.attrs["source"] = "twse"
             return tw
 
-    # 3) 模擬
+    # 3) TPEX（櫃買）
+    if ticker.isdigit():
+        tp = tpex_stock_day_range(ticker, start, end)
+        if not tp.empty:
+            tp.attrs["simulated"] = False
+            tp.attrs["source"] = "tpex"
+            return tp
+
+    # 4) 模擬
     rng = pd.date_range(end=end, periods=lookback_days, freq="B")
     close = np.linspace(100, 110, len(rng)) + np.random.normal(0, 1.5, len(rng))
     openp = close + np.random.normal(0, 0.6, len(rng))
@@ -218,6 +280,8 @@ def load_price_data(ticker: str, end_date_str: str, lookback_days: int) -> pd.Da
     demo = pd.DataFrame({"OPEN": openp, "HIGH": high, "LOW": low, "CLOSE": close, "VOLUME": volume}, index=rng)
     demo.attrs["simulated"] = True
     demo.attrs["source"] = "simulated"
+    if tried_symbols:
+        demo.attrs["tried"] = ",".join(tried_symbols)
     return demo
 
 
@@ -339,7 +403,6 @@ def build_box_report(m: dict, use_vol_filter: bool, cost: float | None, tp_pct: 
     if use_vol_filter:
         lines.append(f"量能過濾判定: {'通過' if vol_ok else '未通過'}{('（'+vol_msg+'）' if vol_msg else '')}")
 
-    # 依成本計算
     if cost is not None and pd.notna(cost):
         lines.append("")
         lines.append("— 依成本計算 —")
@@ -350,7 +413,6 @@ def build_box_report(m: dict, use_vol_filter: bool, cost: float | None, tp_pct: 
         lines.append(f"停利價（+{tp_pct}%）: {tp_price:.2f}" if (tp_pct is not None and pd.notna(tp_price)) else "停利價: （未設定）")
         lines.append(f"停損價（-{sl_pct}%）: {sl_price:.2f}" if (sl_pct is not None and pd.notna(sl_price)) else "停損價: （未設定）")
 
-    # 交易提示
     advice = []
     if pd.notna(close) and pd.notna(ma):
         if close < ma: advice.append("價格低於MA，可觀察逢低/分批")
@@ -381,14 +443,14 @@ st.sidebar.markdown(
     "- KD / MACD（含交叉點）\n"
     "- 多股票相對表現（近1月/3月/半年/YTD）\n"
     "- 下載 CSV/Excel\n"
-    "- yfinance 斷線時自動 TWSE 備援\n"
+    "- yfinance 斷線 → 自動 TWSE/TPEX 備援\n"
 )
 
 with st.form("params"):
     c1, c2, c3, c4 = st.columns([1.2, 1.1, 1, 1])
 
     with c1:
-        tickers_str = st.text_input("股票代碼（可多個，逗號分隔）", value="2330, 2317, 3481")
+        tickers_str = st.text_input("股票代碼（可多個，逗號分隔）", value="2330, 5314, 3481")
         end_dt_str = st.text_input("結束日期（YYYY-MM-DD，可留空=今天）", value="")
         lookback = st.number_input("觀察天數 N（近 N 天）", min_value=30, max_value=3650, value=180, step=1)
         compare_period = st.selectbox("相對表現期間", ["近1月", "近3月", "近半年", "YTD"], index=1)
@@ -415,7 +477,6 @@ with st.form("params"):
     submitted = st.form_submit_button("開始分析")
 
 if submitted:
-    # 解析代碼
     tickers = [t.strip() for t in tickers_str.split(",") if t.strip()]
     if not tickers:
         st.error("請輸入至少一個代碼")
@@ -428,7 +489,6 @@ if submitted:
     except Exception:
         ma_windows = [5, 10, 20, 60]
 
-    # 成本/停利停損
     cost_val = ensure_scalar(cost_str) if cost_str.strip() else np.nan
     cost_for_report = cost_val if pd.notna(cost_val) else None
 
@@ -514,12 +574,12 @@ if submitted:
             c3.metric("上軌(=建議賣價)", f"{m['upper']:.2f}" if pd.notna(m['upper']) else "N/A")
             c4.metric("下靶(箱型下限)", f"{m['lower']:.2f}" if pd.notna(m['lower']) else "N/A")
 
-            # ---- 箱型文字說明（回來了！）----
+            # 箱型文字說明
             report = build_box_report(m, use_vol_filter=vol_filter,
                                       cost=cost_for_report, tp_pct=tp_pct, sl_pct=sl_pct)
             st.text(report)
 
-            # ---- 價格 + 多MA + 布林 + MA5/20 交叉 ----
+            # 價格 + 多MA + 布林 + MA5/20 交叉
             fig1 = plt.figure(figsize=(10.8, 4.2)); ax1 = plt.gca()
             ax1.plot(dfp.index, dfp["CLOSE"], label="收盤")
             for w in ma_windows:
@@ -538,7 +598,7 @@ if submitted:
             fig1.autofmt_xdate(rotation=45)
             st.pyplot(fig1, clear_figure=True)
 
-            # ---- 量價 ----
+            # 量價
             fig2 = plt.figure(figsize=(10.8, 2.8)); ax2 = plt.gca()
             ax2.bar(dfp.index, dfp["VOLUME"], width=0.8, label="成交量")
             if "VOL_MA" in dfp: ax2.plot(dfp.index, dfp["VOL_MA"], label=f"量均({int(vol_win)})")
@@ -547,7 +607,7 @@ if submitted:
             fig2.autofmt_xdate(rotation=45)
             st.pyplot(fig2, clear_figure=True)
 
-            # ---- KD ----
+            # KD
             if show_kd:
                 fig3 = plt.figure(figsize=(10.8, 2.8)); ax3 = plt.gca()
                 ax3.plot(dfp.index, dfp["%K"], label="%K"); ax3.plot(dfp.index, dfp["%D"], label="%D")
@@ -557,7 +617,7 @@ if submitted:
                 fig3.autofmt_xdate(rotation=45)
                 st.pyplot(fig3, clear_figure=True)
 
-            # ---- MACD + 交叉 ----
+            # MACD + 交叉
             if show_macd:
                 fig4 = plt.figure(figsize=(10.8, 3.0)); ax4 = plt.gca()
                 ax4.plot(dfp.index, dfp["MACD"], label="MACD")
@@ -571,7 +631,7 @@ if submitted:
                 fig4.autofmt_xdate(rotation=45)
                 st.pyplot(fig4, clear_figure=True)
 
-            # ---- 下載 ----
+            # 下載
             df_export = dfp.tail(int(lookback)).round(6)
             st.download_button("下載 CSV（最近 N 天指標）",
                                data=make_csv_bytes(df_export),
