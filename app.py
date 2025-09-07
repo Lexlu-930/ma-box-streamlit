@@ -5,6 +5,13 @@
 #   - ✅ 恢復「依成本計算」區塊（當前損益、停利價、停損價）
 #   - 🛠️ 延續：名稱來源（TWSE codeQuery→ISIN→yfinance）、yfinance Series 真值修正、TWSE/TPEX 備援、
 #             相對表現資料檢查、下載 CSV/Excel、MA/KD/MACD 交叉標註
+# === SPEC: 不能缺少的功能 ===
+# [x] 箱型／成本說明 (box_report, cost_report)
+# [x] MA/KD/MACD 圖與交叉標註
+# [x] 相對表現對比 + 期間切換
+# [x] 下載 CSV/Excel
+# [x] TWSE/TPEX/yfinance 資料備援
+# ===========================
 # 作者: LexLu   日期: 2025-09-07
 
 import os, io, re, requests
