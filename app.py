@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 # 技術指標面板（MA / 量價 / KD / MACD）+ 多股票對比 + 箱型進出說明 + 個股名稱顯示
 # 資料來源：yfinance(.TW / .TWO) → TWSE（上市）→ TPEX（櫃買 JSON/CSV）→ 模擬
-# v1.4.8:
-#   - 新增：顯示個股名稱（TWSE ISIN 名稱表優先，yfinance 補充），排名表與分頁/圖標題帶入名稱
-#   - 延續 v1.4.7 修正：避免 Series 的真值判定錯誤
+# v1.4.9:
+#   - 強化名稱抓取：TWSE ISIN 多表容錯；yfinance 依序 get_info() → fast_info → info
+#   - 其餘功能沿用 v1.4.8 / v1.4.7 的修正
 # 作者: LexLu   日期: 2025-09-07
 
 import os, io, re, requests
@@ -15,7 +15,7 @@ import matplotlib.dates as mdates
 from datetime import datetime
 
 AUTHOR  = "LexLu"
-VERSION = "v1.4.8 (2025-09-07)"
+VERSION = "v1.4.9 (2025-09-07)"
 YEAR    = datetime.now().year
 
 # ---------------- 字型 ----------------
@@ -140,7 +140,7 @@ def _tpex_json_month(stock_no: str, month_ts: pd.Timestamp) -> pd.DataFrame:
             r = requests.get(url, params=params, timeout=12, headers=headers)
             js = r.json()
             data = js.get("aaData") or js.get("data") or []
-            if not data:
+            if not data: 
                 continue
             rows = []
             for row in data:
@@ -230,57 +230,90 @@ def _pick_series_any_level(df: pd.DataFrame, name: str, preferred_symbol: str | 
     return df[name] if name in df.columns else None
 
 
-# ---------------- 個股名稱：TWSE ISIN + yfinance 補充 ----------------
+# ---------------- 個股名稱：TWSE ISIN + yfinance 補強 ----------------
+def _normalize_code(ticker: str) -> str:
+    return "".join(ch for ch in ticker if ch.isdigit())
+
 @st.cache_data(show_spinner=False, ttl=86400)
 def load_tw_isin_mapping() -> dict:
     """
-    從 TWSE ISIN 名稱表抓上市/上櫃所有代碼→名稱
+    從 TWSE ISIN 名稱表抓上市/上櫃所有代碼→名稱（多表容錯）
     """
     url = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"
     headers = {"User-Agent": "Mozilla/5.0"}
     r = requests.get(url, timeout=15, headers=headers)
     r.encoding = "utf-8"
     tables = pd.read_html(r.text)
-    df = pd.concat(tables, ignore_index=True)
     mapping = {}
-    # 第一欄通常包含「代碼 名稱」或「代碼　名稱」（含全形空白）
-    for val in df.iloc[:, 0].dropna().astype(str):
-        s = val.replace("\u3000", " ").strip()
-        m = re.match(r"^(\d{4,6})\s+(.+)$", s)
-        if m:
-            mapping[m.group(1)] = m.group(2).strip()
+    for df in tables:
+        # 可能的欄名：['有價證券代號及名稱', '國際證券辨識號碼(ISIN Code)', ...]
+        first_col = df.columns[0]
+        for val in df[first_col].dropna().astype(str):
+            s = val.replace("\u3000", " ").strip()
+            # 允許前面帶英文字（市場別），找出第一個 4~6 位數字代碼
+            m = re.search(r"(\d{4,6})\s+(.+)", s)
+            if m:
+                code = m.group(1)
+                name = m.group(2).strip()
+                # 去除常見註記
+                name = re.sub(r"\s*\(.*?存託憑證.*?\)\s*", "", name)
+                mapping[code] = name
     return mapping
 
 @st.cache_data(show_spinner=False, ttl=86400)
 def get_stock_name(ticker: str) -> str:
-    code = "".join(ch for ch in ticker if ch.isdigit())
-    # 1) TWSE ISIN 名稱表
+    code = _normalize_code(ticker)
+
+    # 1) TWSE ISIN 名稱表（最快、覆蓋上市+上櫃）
     try:
         mp = load_tw_isin_mapping()
-        if code in mp:
-            return mp[code]
+        if code in mp and isinstance(mp[code], str) and mp[code].strip():
+            return mp[code].strip()
     except Exception:
         pass
-    # 2) yfinance 補充
+
+    # 2) yfinance（新版優先 get_info()，再 fast_info，最後舊 .info）
     if HAS_YF:
         for sym in [f"{code}.TW", f"{code}.TWO", ticker]:
             try:
                 tkr = yf.Ticker(sym)
-                name = None
-                # fast_info 可能沒有名稱，退而求其次用 info
+
+                # 2-1 get_info()
                 try:
-                    info = tkr.info
-                    name = info.get("shortName") or info.get("longName")
+                    info = tkr.get_info()
+                    nm = (info or {}).get("shortName") or (info or {}).get("longName")
+                    if nm and str(nm).strip():
+                        return str(nm).strip()
                 except Exception:
-                    name = None
-                if name:
-                    return str(name)
+                    pass
+
+                # 2-2 fast_info
+                try:
+                    fi = getattr(tkr, "fast_info", None)
+                    if isinstance(fi, dict):
+                        nm = fi.get("shortName") or fi.get("longName")
+                        if nm and str(nm).strip():
+                            return str(nm).strip()
+                except Exception:
+                    pass
+
+                # 2-3 舊 .info
+                try:
+                    info2 = getattr(tkr, "info", None)
+                    if isinstance(info2, dict):
+                        nm = info2.get("shortName") or info2.get("longName")
+                        if nm and str(nm).strip():
+                            return str(nm).strip()
+                except Exception:
+                    pass
+
             except Exception:
                 continue
+
     return ""
 
 
-# ---------------- 資料載入（修正 Series 邏輯） ----------------
+# ---------------- 資料載入（避免 Series 真值判定） ----------------
 @st.cache_data(show_spinner=False)
 def load_price_data(ticker: str, end_date_str: str, lookback_days: int) -> pd.DataFrame:
     """
