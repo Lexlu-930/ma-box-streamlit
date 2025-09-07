@@ -1,16 +1,15 @@
 # -*- coding: utf-8 -*-
-# Streamlit 版：MA + k×標準差（箱型）分析（含中文字體與日期軸優化、雲端字型載入）
+# Streamlit 版：MA + k×標準差（箱型）分析
+# 修正：相容 yfinance 對台股回傳的「多層欄位（MultiIndex）」格式，避免誤判為空而落回假資料。
 
+import os
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-import os
 
-# ---- 優先嘗試載入專案內字型（雲端通常沒有中文字型）----
-# 你可以放一個字型檔在 fonts/NotoSansCJKtc-Regular.otf
+# ====== 字型設定（雲端通常沒有中文字型，支援專案內 fonts/ 自帶字型）======
 try:
     from matplotlib import font_manager
     FONT_PATH = os.path.join(os.path.dirname(__file__), "fonts", "NotoSansCJKtc-Regular.otf")
@@ -18,24 +17,23 @@ try:
         font_manager.fontManager.addfont(FONT_PATH)
         plt.rcParams["font.family"] = font_manager.FontProperties(fname=FONT_PATH).get_name()
     else:
-        # 備援：常見的中文字型名稱清單（雲端未必存在）
         plt.rcParams["font.sans-serif"] = [
             "Microsoft JhengHei", "SimHei", "PMingLiU", "Noto Sans CJK TC",
             "Noto Sans CJK SC", "PingFang TC", "PingFang SC", "WenQuanYi Zen Hei"
         ]
     plt.rcParams["axes.unicode_minus"] = False
 except Exception:
-    pass  # 即使字型載入失敗，也不阻斷執行
+    pass
 
-# ---- 嘗試載入 yfinance；失敗仍可用假資料 ----
+# ====== 嘗試載入 yfinance；失敗仍能用假資料 ======
 try:
     import yfinance as yf
     HAS_YF = True
 except Exception:
     HAS_YF = False
 
-# ================= 工具函式 =================
 
+# ================= 工具函式 =================
 def ensure_scalar(x):
     """把任何 DataFrame/Series/ndarray/字串壓成單一 float 或 np.nan，避免 ambiguous 真值判斷。"""
     try:
@@ -53,6 +51,7 @@ def ensure_scalar(x):
     except Exception:
         return np.nan
 
+
 def parse_end_date(end_date_str: str) -> pd.Timestamp | None:
     """將 YYYY-MM-DD 或空字串 轉成 Timestamp（空字串=今天）；錯誤回傳 None。"""
     if not end_date_str.strip():
@@ -62,14 +61,19 @@ def parse_end_date(end_date_str: str) -> pd.Timestamp | None:
     except Exception:
         return None
 
+
 @st.cache_data(show_spinner=False)
 def load_price_data(ticker: str, end_date_str: str, lookback_days: int) -> pd.DataFrame:
-    """優先用 yfinance；失敗則回傳假資料。至少需包含 CLOSE、VOLUME 欄。"""
+    """
+    優先用 yfinance；成功則回傳含 CLOSE、VOLUME 欄位的 DataFrame。
+    - 兼容 yfinance 可能回傳的 MultiIndex 欄位（台股常見：第一層為價格欄位名稱，第二層為 Ticker）。
+    - 若取不到資料，回傳假資料；並在 df.attrs['simulated'] = True 標示。
+    """
     end = parse_end_date(end_date_str)
     if end is None:
         return pd.DataFrame()
-    start = end - pd.Timedelta(days=max(lookback_days * 2, 120))  # 多抓避免滾動窗口 NaN
 
+    start = end - pd.Timedelta(days=max(lookback_days * 2, 120))  # 多抓避免滾動窗口 NaN
     yf_symbol = f"{ticker}.TW" if ticker.isdigit() else ticker
 
     if HAS_YF:
@@ -81,16 +85,72 @@ def load_price_data(ticker: str, end_date_str: str, lookback_days: int) -> pd.Da
                 progress=False,
             )
             if not df.empty:
-                out = df.rename(columns={"Close": "CLOSE", "Volume": "VOLUME"})[["CLOSE", "VOLUME"]].copy()
-                return out.dropna(how="all")
+                # ---- 關鍵相容處理：展開可能的 MultiIndex 欄位 ----
+                close_series = None
+                volume_series = None
+
+                if isinstance(df.columns, pd.MultiIndex):
+                    # 典型台股：level 0 為 'Close'/'Volume'，level 1 為 '3481.TW' 之類的 ticker
+                    if "Close" in df.columns.get_level_values(0):
+                        try:
+                            close_df = df.xs("Close", axis=1, level=0, drop_level=True)
+                            # 一般會只有一個 ticker 欄，取第一欄
+                            close_series = close_df.iloc[:, 0] if isinstance(close_df, pd.DataFrame) else close_df
+                        except Exception:
+                            pass
+                    if "Volume" in df.columns.get_level_values(0):
+                        try:
+                            vol_df = df.xs("Volume", axis=1, level=0, drop_level=True)
+                            volume_series = vol_df.iloc[:, 0] if isinstance(vol_df, pd.DataFrame) else vol_df
+                        except Exception:
+                            pass
+
+                    # 退一步：嘗試用 (欄位, ticker) 直接取
+                    if close_series is None:
+                        maybe = (("Close", yf_symbol),)
+                        for key in maybe:
+                            if key in df:
+                                close_series = df[key]
+                                break
+                    if volume_series is None:
+                        maybe = (("Volume", yf_symbol),)
+                        for key in maybe:
+                            if key in df:
+                                volume_series = df[key]
+                                break
+
+                else:
+                    # 單層欄位
+                    if "Close" in df.columns:
+                        close_series = df["Close"]
+                    elif "Adj Close" in df.columns:
+                        close_series = df["Adj Close"]  # 作為備援
+                    else:
+                        # 若欄名不可預期，嘗試第一欄
+                        close_series = df.iloc[:, 0]
+
+                    if "Volume" in df.columns:
+                        volume_series = df["Volume"]
+                    else:
+                        # 若沒有 Volume，最後一欄當備援
+                        volume_series = df.iloc[:, -1]
+
+                if close_series is not None and volume_series is not None:
+                    out = pd.DataFrame({"CLOSE": close_series, "VOLUME": volume_series}).dropna(how="all")
+                    out.attrs["simulated"] = False
+                    return out
         except Exception:
+            # 下載異常，下面用假資料
             pass
 
-    # fallback：假資料（商業日）
+    # ---- fallback：假資料（商業日）----
     rng = pd.date_range(end=end, periods=lookback_days, freq="B")
     close = np.linspace(100, 110, len(rng)) + np.random.normal(0, 1.5, len(rng))
     volume = np.random.randint(1200, 3000, size=len(rng))
-    return pd.DataFrame({"CLOSE": close, "VOLUME": volume}, index=rng)
+    demo = pd.DataFrame({"CLOSE": close, "VOLUME": volume}, index=rng)
+    demo.attrs["simulated"] = True
+    return demo
+
 
 def analyze(df: pd.DataFrame, lookback: int, ma_win: int, vol_win: int, k: float,
             use_vol_filter: bool, cost, tp_pct, sl_pct):
@@ -179,8 +239,8 @@ def analyze(df: pd.DataFrame, lookback: int, ma_win: int, vol_win: int, k: float
     report = "\n".join(lines)
     return report, df, None
 
-# ================= Streamlit UI =================
 
+# ================= Streamlit UI =================
 st.set_page_config(page_title="MA 規則判斷（網頁版）", layout="centered")
 st.title("MA 規則判斷（網頁版）")
 
@@ -205,9 +265,9 @@ with st.form("params"):
 
 if submitted:
     cost = ensure_scalar(cost_str) if cost_str.strip() else np.nan
-    df = load_price_data(ticker.strip(), end_dt_str, int(lookback))
+    df_raw = load_price_data(ticker.strip(), end_dt_str, int(lookback))
     report, df_ind, err = analyze(
-        df=df,
+        df=df_raw,
         lookback=int(lookback),
         ma_win=int(ma_win),
         vol_win=int(vol_win),
@@ -221,6 +281,10 @@ if submitted:
     if err:
         st.error(err)
     else:
+        # 若是模擬資料，給出提醒
+        if df_raw.attrs.get("simulated", False):
+            st.warning("目前無法從資料源取得實際行情，以下為模擬資料（僅示範用途）。")
+
         st.text(report)
 
         # ---- 圖表：收盤/MA/上下軌（含日期軸優化與中文顯示）----
@@ -233,7 +297,6 @@ if submitted:
         ax.legend()
         ax.set_title("價格 / MA / 上下軌")
 
-        # 日期軸：自動 locator + concise formatter，並旋轉避免擠在一起
         locator = mdates.AutoDateLocator()
         formatter = mdates.ConciseDateFormatter(locator)
         ax.xaxis.set_major_locator(locator)
