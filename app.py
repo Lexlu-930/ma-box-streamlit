@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
-# 技術指標面板（MA / 量價 / KD / MACD）+ 多股票對比 + 箱型進出說明 + 中文名稱（可顯示簡短）
-# v1.5.3:
-#   - 修正：避免以 `or` 串接 Pandas Series（會觸發「Series 真值不明確」），改用顯式 None 檢查
-#   - 其他功能沿用：名稱來源（TWSE codeQuery→ISIN→yfinance）、TWSE/TPEX 備援、相對表現檢查、下載報表等
+# 技術指標面板（MA / 量價 / KD / MACD）+ 多股票對比 + 箱型進出說明 + 依成本計算 + 中文名稱（可顯示簡短）
+# v1.5.4:
+#   - ✅ 恢復「箱型進出價」文字說明（含建議買價/賣價/下限 & 量能過濾訊息）
+#   - ✅ 恢復「依成本計算」區塊（當前損益、停利價、停損價）
+#   - 🛠️ 延續：名稱來源（TWSE codeQuery→ISIN→yfinance）、yfinance Series 真值修正、TWSE/TPEX 備援、
+#             相對表現資料檢查、下載 CSV/Excel、MA/KD/MACD 交叉標註
 # 作者: LexLu   日期: 2025-09-07
 
 import os, io, re, requests
@@ -14,7 +16,7 @@ import matplotlib.dates as mdates
 from datetime import datetime
 
 AUTHOR  = "LexLu"
-VERSION = "v1.5.3 (2025-09-07)"
+VERSION = "v1.5.4 (2025-09-07)"
 YEAR    = datetime.now().year
 
 # ===== 字型 =====
@@ -99,12 +101,12 @@ def twse_stock_day_range(stock_no: str, start: pd.Timestamp, end: pd.Timestamp) 
             for row in data:
                 day = _roc_to_gregorian(row[fidx.get("日期",0)])
                 if day is None or not (start <= day <= end): continue
-                def fnum(s): 
-                    s = str(s).replace(",","").replace("X","").strip()
+                def fnum(s):
+                    s = str(s).replace(",", "").replace("X", "").strip()
                     try: return float(s)
                     except: return np.nan
                 def inum(s):
-                    s = str(s).replace(",","").strip()
+                    s = str(s).replace(",", "").strip()
                     try: return int(s)
                     except: return np.nan
                 rows.append((day, fnum(row[fidx.get("開盤價",-1)]), fnum(row[fidx.get("最高價",-1)]),
@@ -204,7 +206,7 @@ def _pick_series_any_level(df: pd.DataFrame, name: str, preferred_symbol: str | 
         return None
     return df[name] if name in df.columns else None
 
-# ===== 個股名稱（中文為主） =====
+# ===== 名稱（中文為主） =====
 def _normalize_code(ticker: str) -> str:
     return "".join(ch for ch in ticker if ch.isdigit())
 
@@ -308,7 +310,6 @@ def load_price_data(ticker: str, end_date_str: str, lookback_days: int) -> pd.Da
                 if df is None or df.empty:
                     attempts.append(f"yfinance({sym}): empty"); continue
 
-                # 這裡不能用 `or`，否則會對 Series 做真假判斷而報錯
                 close_s = _pick_series_any_level(df, "Close", preferred_symbol=sym)
                 if close_s is None:
                     close_s = _pick_series_any_level(df, "Adj Close", preferred_symbol=sym)
@@ -351,6 +352,7 @@ def load_price_data(ticker: str, end_date_str: str, lookback_days: int) -> pd.Da
             return tp
         attempts.append("tpex: empty")
 
+    # Demo 資料（最後備援）
     rng = pd.date_range(end=end, periods=lookback_days, freq="B")
     close  = np.linspace(100,110,len(rng)) + np.random.normal(0,1.5,len(rng))
     openp  = close + np.random.normal(0,0.6,len(rng))
@@ -392,7 +394,7 @@ def analyze_core(df: pd.DataFrame, vol_filter: bool, vol_win: int, k_boll: float
     vol_ok=True; vol_msg=""
     if vol_filter:
         if pd.notna(vol) and pd.notna(volma):
-            vol_ok = (vol >= volma); 
+            vol_ok = (vol >= volma)
             if not vol_ok: vol_msg="量能不足（最後一日 < 量均）"
         else:
             vol_ok=False; vol_msg="量能資料不足，無法判斷"
@@ -414,7 +416,8 @@ def make_excel_bytes(df: pd.DataFrame) -> bytes | None:
         bio.seek(0); return bio.read()
     except Exception: return None
 
-def build_box_report(m: dict, use_vol_filter: bool, cost: float | None, tp_pct: float | None, sl_pct: float | None) -> str:
+# ============ 箱型 / 成本說明 ============
+def build_box_report(m: dict, use_vol_filter: bool) -> str:
     close, ma, upper, lower = m["close"], m["ma"], m["upper"], m["lower"]
     vol, volma, vol_ok, vol_msg = m["vol"], m["volma"], m["vol_ok"], m.get("vol_msg","")
     lines = [
@@ -425,7 +428,20 @@ def build_box_report(m: dict, use_vol_filter: bool, cost: float | None, tp_pct: 
         f"箱型下限: {lower:.2f}" if pd.notna(lower) else "箱型下限: N/A",
         f"成交量 / 量均: {int(vol) if pd.notna(vol) else 'N/A'} / {int(volma) if pd.notna(volma) else 'N/A'}"
     ]
-    if use_vol_filter: lines.append(f"量能過濾判定: {'通過' if vol_ok else '未通過'}{('（'+vol_msg+'）' if vol_msg else '')}")
+    if use_vol_filter:
+        lines.append(f"量能過濾判定: {'通過' if vol_ok else '未通過'}{('（'+vol_msg+'）' if vol_msg else '')}")
+    return "\n".join(lines)
+
+def build_cost_report(cost: float | None, tp_pct: float, sl_pct: float, close: float) -> str:
+    if cost is None or pd.isna(cost):
+        return "（未填持有成本，略）"
+    lines = ["— 依成本計算 —"]
+    pnl = (close - cost) / cost * 100 if (pd.notna(close) and cost) else np.nan
+    tp  = cost * (1 + tp_pct/100) if cost else np.nan
+    sl  = cost * (1 - sl_pct/100) if cost else np.nan
+    lines.append(f"目前損益: {pnl:.2f}%" if pd.notna(pnl) else "目前損益: N/A")
+    lines.append(f"停利價 (+{tp_pct:.1f}%): {tp:.2f}" if pd.notna(tp) else "停利價: N/A")
+    lines.append(f"停損價 (-{sl_pct:.1f}%): {sl:.2f}" if pd.notna(sl) else "停損價: N/A")
     return "\n".join(lines)
 
 # ===== Streamlit UI =====
@@ -445,7 +461,7 @@ st.sidebar.markdown(
 )
 
 with st.form("params"):
-    c1,c2,c3,c4 = st.columns([1.2,1.1,1,1])
+    c1,c2,c3,c4 = st.columns([1.25,1.2,1,1])
     with c1:
         tickers_str = st.text_input("股票代碼（可多個，逗號分隔）", value="6672, 5314, 3481")
         end_dt_str   = st.text_input("結束日期（YYYY-MM-DD，可留空=今天）", value="")
@@ -463,23 +479,43 @@ with st.form("params"):
         macd_fast  = st.number_input("MACD 快線", min_value=5, max_value=20, value=12, step=1)
         macd_slow  = st.number_input("MACD 慢線", min_value=10, max_value=40, value=26, step=1)
         macd_signal= st.number_input("MACD 訊號線", min_value=5, max_value=20, value=9, step=1)
+    st.markdown("---")
+    c5,c6,c7 = st.columns([1,1,1.2])
+    with c5:
+        tp_pct = st.number_input("獲利門檻（+%）", min_value=0.1, max_value=100.0, value=8.0, step=0.1)
+    with c6:
+        sl_pct = st.number_input("停損門檻（-%）", min_value=0.1, max_value=100.0, value=5.0, step=0.1)
+    with c7:
+        cost_str = st.text_input("持有成本（可空白）", value="")
     submitted = st.form_submit_button("開始分析")
 
-if not submitted: st.stop()
+if not submitted:
+    st.stop()
 
 tickers = [t.strip() for t in tickers_str.split(",") if t.strip()]
-if not tickers: st.error("請輸入至少一個代碼"); st.stop()
+if not tickers:
+    st.error("請輸入至少一個代碼")
+    st.stop()
 
+def parse_cost(s: str) -> float | None:
+    s = s.strip()
+    if not s: return None
+    try:
+        v = float(s)
+        return v if v > 0 else None
+    except Exception:
+        return None
+user_cost = parse_cost(cost_str)
+
+# 解析 MA 清單
 try:
     ma_windows = sorted({int(x.strip()) for x in ma_list_str.split(",") if x.strip().isdigit()})
     ma_windows = [w for w in ma_windows if w > 0]
 except Exception:
     ma_windows = [5,10,20,60]
 
+# 名稱
 raw_name_map = {tk: get_stock_name_raw(tk) for tk in tickers}
-def is_ascii(s: str) -> bool:
-    try: s.encode("ascii"); return True
-    except Exception: return False
 def show_name(n: str) -> str:
     if name_mode == "完整": return n
     if not n or is_ascii(n): return n
@@ -491,7 +527,7 @@ for tk in tickers:
     df_raw = load_price_data(tk, end_dt_str, int(lookback))
     if df_raw.empty: continue
     df_proc, metrics = analyze_core(df=df_raw, vol_filter=vol_filter, vol_win=int(vol_win), k_boll=float(k_boll), boll_win=int(boll_win))
-    df_proc = add_mas(df_proc, ma_windows + [5,20])
+    df_proc = add_mas(df_proc, ma_windows + [5,20])  # 為交叉偵測加 MA5/MA20
     df_proc = add_kd(df_proc, n=9, k_smooth=3, d_smooth=3)
     df_proc = add_macd(df_proc, fast=int(macd_fast), slow=int(macd_slow), signal=int(macd_signal))
     vol_pass = (df_proc["VOLUME"] >= df_proc["VOL_MA"]).tail(int(lookback)).sum()
@@ -506,9 +542,11 @@ for tk in tickers:
         "name_full": raw_name_map.get(tk,""),
     }
 
-if not results: st.error("所有代碼皆讀不到資料"); st.stop()
+if not results:
+    st.error("所有代碼皆讀不到資料")
+    st.stop()
 
-# 排名表
+# ===== 排名表 =====
 rows=[]
 for tk,r in results.items():
     dfp=r["df"].tail(int(lookback))
@@ -528,7 +566,7 @@ for tk,r in results.items():
 st.subheader("多股票排名表（近 N 天）")
 st.dataframe(pd.DataFrame(rows))
 
-# 相對表現（含資料檢查）
+# ===== 相對表現 =====
 st.subheader(f"多股票相對表現（{compare_period}）")
 end_dt = parse_end_date(end_dt_str) or pd.Timestamp.today().normalize()
 start_cmp = period_start_from_choice(end_dt, compare_period)
@@ -561,7 +599,7 @@ if missing_info:
     with st.expander("相對表現未繪製原因（資料檢查）"):
         st.write("\n".join(missing_info))
 
-# 個股分頁
+# ===== 個股分頁 =====
 tabs = st.tabs([ (f"{tk} {results[tk].get('name','')}".strip()) for tk in tickers ])
 for i,tk in enumerate(tickers):
     if tk not in results:
@@ -570,37 +608,42 @@ for i,tk in enumerate(tickers):
     with tabs[i]:
         if r["sim"]:
             st.warning("⚠️ 此檔目前使用模擬/替代資料（僅示範用途）。")
-            if r.get("attempts"): 
+            if r.get("attempts"):
                 with st.expander("資料來源嘗試紀錄（debug）"): st.write("\n".join(r["attempts"]))
 
+        # 指標重點數字
         c1,c2,c3,c4 = st.columns(4)
         c1.metric("收盤價", f"{m['close']:.2f}" if pd.notna(m['close']) else "N/A")
         c2.metric("中軌MA(=建議買價)", f"{m['ma']:.2f}" if pd.notna(m['ma']) else "N/A")
         c3.metric("上軌(=建議賣價)", f"{m['upper']:.2f}" if pd.notna(m['upper']) else "N/A")
         c4.metric("下靶(箱型下限)", f"{m['lower']:.2f}" if pd.notna(m['lower']) else "N/A")
 
+        # 價格/MA/布林 + MA5xMA20 交叉
         fig1=plt.figure(figsize=(10.8,4.2)); ax1=plt.gca()
         ax1.plot(dfp.index, dfp["CLOSE"], label="收盤")
         for w in ma_windows:
             col=f"MA{w}"
             if col in dfp: ax1.plot(dfp.index, dfp[col], label=f"MA{w}")
         ax1.plot(dfp.index, dfp["BOLL_MA"], label=f"BOLL_MA({int(boll_win)})")
-        ax1.plot(dfp.index, dfp["BOLL_UPPER"], label="上軌"); ax1.plot(dfp.index, dfp["BOLL_LOWER"], label="下軌")
+        ax1.plot(dfp.index, dfp["BOLL_UPPER"], label="上軌"); ax1.plot(dfp.index, dfp["BOLL_LOWER"], label="下靶")
         if "MA5" in dfp and "MA20" in dfp:
             g,d=detect_cross(dfp["MA5"], dfp["MA20"])
             ax1.scatter(g, dfp.loc[g,"CLOSE"], marker="^", s=60, label="MA5↑MA20", zorder=3)
             ax1.scatter(d, dfp.loc[d,"CLOSE"], marker="v", s=60, label="MA5↓MA20", zorder=3)
         ax1.legend(); ax1.set_title(f"{title_prefix}｜價格 / 多MA / 布林")
+        locator = mdates.AutoDateLocator(); formatter = mdates.ConciseDateFormatter(locator)
         ax1.xaxis.set_major_locator(locator); ax1.xaxis.set_major_formatter(formatter)
         fig1.autofmt_xdate(rotation=45); st.pyplot(fig1, clear_figure=True)
 
+        # 量價
         fig2=plt.figure(figsize=(10.8,2.8)); ax2=plt.gca()
         ax2.bar(dfp.index, dfp["VOLUME"], width=0.8, label="成交量")
         if "VOL_MA" in dfp: ax2.plot(dfp.index, dfp["VOL_MA"], label=f"量均({int(vol_win)})")
-        ax2.legend(); ax2.set_title(f"{title_prefix}｜量價（成交量與量均）")
+        ax2.legend(); ax2.set_title(f"{title_prefix}｜量價")
         ax2.xaxis.set_major_locator(locator); ax2.xaxis.set_major_formatter(formatter)
         fig2.autofmt_xdate(rotation=45); st.pyplot(fig2, clear_figure=True)
 
+        # KD
         fig3=plt.figure(figsize=(10.8,2.8)); ax3=plt.gca()
         ax3.plot(dfp.index, dfp["%K"], label="%K"); ax3.plot(dfp.index, dfp["%D"], label="%D")
         ax3.axhline(80, linestyle="--", linewidth=1); ax3.axhline(20, linestyle="--", linewidth=1)
@@ -608,6 +651,7 @@ for i,tk in enumerate(tickers):
         ax3.xaxis.set_major_locator(locator); ax3.xaxis.set_major_formatter(formatter)
         fig3.autofmt_xdate(rotation=45); st.pyplot(fig3, clear_figure=True)
 
+        # MACD
         fig4=plt.figure(figsize=(10.8,3.0)); ax4=plt.gca()
         ax4.plot(dfp.index, dfp["MACD"], label="MACD")
         ax4.plot(dfp.index, dfp["MACD_SIGNAL"], label="Signal")
@@ -619,6 +663,20 @@ for i,tk in enumerate(tickers):
         ax4.xaxis.set_major_locator(locator); ax4.xaxis.set_major_formatter(formatter)
         fig4.autofmt_xdate(rotation=45); st.pyplot(fig4, clear_figure=True)
 
+        # ===== 🔶 箱型進出價 & 依成本計算（回歸！） =====
+        st.markdown("### 箱型 / 成本說明")
+        st.text(build_box_report(m, vol_filter))
+        st.text(build_cost_report(user_cost, float(tp_pct), float(sl_pct), m["close"]))
+
+        # 交易提示（簡要）
+        st.markdown("### 交易提示（參考）")
+        st.markdown(
+            "- **價格低於 MA**：可觀察逢低 / 分批。\n"
+            "- **價格接近上軌**：留意壓力，分批減碼或設移動停利。\n"
+            "- **量能通過**：放量上攻較佳，若量縮跌破 MA 需謹慎。"
+        )
+
+        # 下載報表
         df_export = dfp.tail(int(lookback)).round(6)
         st.download_button("下載 CSV（最近 N 天指標）", data=make_csv_bytes(df_export),
                            file_name=f"{tk}_indicators_last_{int(lookback)}d.csv", mime="text/csv")
