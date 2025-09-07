@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-# Streamlit 版：MA + k×標準差（箱型）分析 + 指標面板 (MA/量價/KD/MACD)
-# 精簡：拿掉不支援的基本面項目（個股獲利來源、毛利率、營收、EPS、合理本益比）
+# 技術指標面板（MA / 量價 / KD / MACD）
+# 修正版：強化 yfinance 多層欄位解析（任一層出現 Close/Volume 都能抓到，不再誤回模擬）
 # 作者: LexLu
-# 版本: v1.4 (2025-09-07)
+# 版本: v1.4.1 (2025-09-07)
 
 import os
 import streamlit as st
@@ -14,7 +14,7 @@ from datetime import datetime
 
 # ====== 基本資訊 ======
 AUTHOR = "LexLu"
-VERSION = "v1.4 (2025-09-07)"
+VERSION = "v1.4.1 (2025-09-07)"
 YEAR = datetime.now().year
 
 # ====== 字型設定（雲端通常沒有中文字型，支援專案內 fonts/ 自帶字型）======
@@ -73,8 +73,8 @@ def parse_end_date(end_date_str: str) -> pd.Timestamp | None:
 @st.cache_data(show_spinner=False)
 def load_price_data(ticker: str, end_date_str: str, lookback_days: int) -> pd.DataFrame:
     """
-    下載 OHLCV（優先 yfinance；支持台股多層欄位），回傳含 OPEN/HIGH/LOW/CLOSE/VOLUME。
-    失敗則回傳假資料，並在 df.attrs['simulated']=True 標註。
+    下載 OHLCV（優先 yfinance；支援台股多層欄位），回傳含 OPEN/HIGH/LOW/CLOSE/VOLUME。
+    失敗則回傳假資料，並在 df.attrs['simulated']=True 標註，且回傳 df.attrs['debug_cols'] 供除錯顯示。
     """
     end = parse_end_date(end_date_str)
     if end is None:
@@ -83,30 +83,36 @@ def load_price_data(ticker: str, end_date_str: str, lookback_days: int) -> pd.Da
     start = end - pd.Timedelta(days=max(lookback_days * 2, 120))
     yf_symbol = f"{ticker}.TW" if ticker.isdigit() else ticker
 
-    def _to_ohlcv(df: pd.DataFrame) -> pd.DataFrame | None:
-        open_s = high_s = low_s = close_s = vol_s = None
+    def _pick_series_any_level(df: pd.DataFrame, name: str, preferred_symbol: str | None = None):
+        """
+        從 MultiIndex/單層欄位中，搜尋任一層名為 `name` 的欄位並回傳 Series。
+        - 若為 MultiIndex：依序檢查每個 level；命中後 xs 掉該層，若還有多欄，優先取 preferred_symbol，否則取第一欄。
+        - 若為單層：直接取欄名；不存在則回 None。
+        """
         if isinstance(df.columns, pd.MultiIndex):
-            # 嘗試 level=0 為欄位名
-            def pick(name: str):
-                if name in df.columns.get_level_values(0):
-                    sub = df.xs(name, axis=1, level=0, drop_level=True)
-                    return sub.iloc[:, 0] if isinstance(sub, pd.DataFrame) else sub
-                return None
-            open_s  = pick("Open")
-            high_s  = pick("High")
-            low_s   = pick("Low")
-            close_s = pick("Close") or pick("Adj Close")
-            vol_s   = pick("Volume")
+            for level in range(df.columns.nlevels):
+                vals = df.columns.get_level_values(level)
+                if name in vals:
+                    sub = df.xs(name, axis=1, level=level, drop_level=True)
+                    if isinstance(sub, pd.DataFrame):
+                        if preferred_symbol and preferred_symbol in sub.columns:
+                            return sub[preferred_symbol]
+                        return sub.iloc[:, 0]
+                    return sub
+            return None
         else:
-            cols = df.columns
-            open_s  = df["Open"] if "Open" in cols else None
-            high_s  = df["High"] if "High" in cols else None
-            low_s   = df["Low"]  if "Low"  in cols else None
-            close_s = df["Close"] if "Close" in cols else (df["Adj Close"] if "Adj Close" in cols else None)
-            vol_s   = df["Volume"] if "Volume" in cols else None
-            # 備援
-            if close_s is None and df.shape[1] > 0: close_s = df.iloc[:, 0]
-            if vol_s   is None and df.shape[1] > 1: vol_s   = df.iloc[:, -1]
+            return df[name] if name in df.columns else None
+
+    def _to_ohlcv(df: pd.DataFrame) -> pd.DataFrame | None:
+        # 依序找 Close 或 Adj Close；Volume；Open/High/Low 非必要
+        close_s = _pick_series_any_level(df, "Close", preferred_symbol=yf_symbol)
+        if close_s is None:
+            close_s = _pick_series_any_level(df, "Adj Close", preferred_symbol=yf_symbol)
+        vol_s = _pick_series_any_level(df, "Volume", preferred_symbol=yf_symbol)
+
+        open_s = _pick_series_any_level(df, "Open", preferred_symbol=yf_symbol)
+        high_s = _pick_series_any_level(df, "High", preferred_symbol=yf_symbol)
+        low_s  = _pick_series_any_level(df, "Low",  preferred_symbol=yf_symbol)
 
         if close_s is None or vol_s is None:
             return None
@@ -120,6 +126,7 @@ def load_price_data(ticker: str, end_date_str: str, lookback_days: int) -> pd.Da
         }).dropna(subset=["CLOSE"])
         return out
 
+    raw_cols_repr = None  # 失敗時帶回欄位資訊
     if HAS_YF:
         try:
             df = yf.download(
@@ -127,9 +134,15 @@ def load_price_data(ticker: str, end_date_str: str, lookback_days: int) -> pd.Da
                 start=start.strftime("%Y-%m-%d"),
                 end=(end + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
                 progress=False,
-                auto_adjust=True,  # yfinance 新版預設 True
+                auto_adjust=True,  # 新版 yfinance 預設 True
             )
             if not df.empty:
+                # 記下欄位結構，若後面失敗用於除錯顯示
+                try:
+                    raw_cols_repr = str(df.columns)
+                except Exception:
+                    raw_cols_repr = None
+
                 ohlcv = _to_ohlcv(df)
                 if ohlcv is not None and not ohlcv.empty:
                     ohlcv.attrs["simulated"] = False
@@ -137,7 +150,7 @@ def load_price_data(ticker: str, end_date_str: str, lookback_days: int) -> pd.Da
         except Exception:
             pass
 
-    # fallback 假資料
+    # ---- fallback 假資料 ----
     rng = pd.date_range(end=end, periods=lookback_days, freq="B")
     close = np.linspace(100, 110, len(rng)) + np.random.normal(0, 1.5, len(rng))
     openp = close + np.random.normal(0, 0.6, len(rng))
@@ -146,6 +159,8 @@ def load_price_data(ticker: str, end_date_str: str, lookback_days: int) -> pd.Da
     volume = np.random.randint(1200, 3000, size=len(rng))
     demo = pd.DataFrame({"OPEN": openp, "HIGH": high, "LOW": low, "CLOSE": close, "VOLUME": volume}, index=rng)
     demo.attrs["simulated"] = True
+    if raw_cols_repr is not None:
+        demo.attrs["debug_cols"] = raw_cols_repr
     return demo
 
 
@@ -302,6 +317,11 @@ if submitted:
 
     if df_raw.attrs.get("simulated", False):
         st.warning("⚠️ 注意：目前無法從資料源取得實際行情，以下為模擬資料（僅示範用途）。")
+        # 額外提供欄位除錯資訊
+        dbg = df_raw.attrs.get("debug_cols", None)
+        if dbg:
+            with st.expander("資料來源欄位除錯（給開發者用）"):
+                st.code(dbg)
 
     # ----------- 圖1：價格 + MA + 布林 -----------
     fig1 = plt.figure(figsize=(11, 4.2))
