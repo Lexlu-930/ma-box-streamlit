@@ -5,3 +5,19 @@ git commit -m "init streamlit app"
 git branch -M main
 git remote add origin https://github.com/LexLu-930/ma-box-streamlit.git
 git push -u origin main
+
+git config --global user.name "LexLu-930"
+git config --global user.email "alummi930@email.com"
+
+
+git remote remove origin 2>NUL
+git remote add origin https://github.com/LexLu-930/ma-box-streamlit.git
+
+
+更新程式 → 修改 app.py → git add . && git commit -m "update" && git push
+
+Cloud 會自動重新部署，不用手動點 Deploy。
+
+
+網址
+https://ma-box-app-ytlptex6zb6fgc2hl3ks5q.streamlit.app/

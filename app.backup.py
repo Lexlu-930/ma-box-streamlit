@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Streamlit 版：MA + k×標準差（箱型）分析（含中文字體與日期軸優化）
+# Streamlit 版：MA + k×標準差（箱型）分析（含中文字體與日期軸優化、雲端字型載入）
 
 import streamlit as st
 import pandas as pd
@@ -7,14 +7,25 @@ import numpy as np
 from datetime import datetime
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import os
 
-# ---- 字型設定（中文顯示與負號）----
-# Windows：優先使用微軟正黑體，其次黑體/新細明體等；其他系統也提供備援清單
-plt.rcParams["font.sans-serif"] = [
-    "Microsoft JhengHei", "SimHei", "PMingLiU", "Noto Sans CJK TC",
-    "Noto Sans CJK SC", "PingFang TC", "PingFang SC", "WenQuanYi Zen Hei"
-]
-plt.rcParams["axes.unicode_minus"] = False
+# ---- 優先嘗試載入專案內字型（雲端通常沒有中文字型）----
+# 你可以放一個字型檔在 fonts/NotoSansCJKtc-Regular.otf
+try:
+    from matplotlib import font_manager
+    FONT_PATH = os.path.join(os.path.dirname(__file__), "fonts", "NotoSansCJKtc-Regular.otf")
+    if os.path.exists(FONT_PATH):
+        font_manager.fontManager.addfont(FONT_PATH)
+        plt.rcParams["font.family"] = font_manager.FontProperties(fname=FONT_PATH).get_name()
+    else:
+        # 備援：常見的中文字型名稱清單（雲端未必存在）
+        plt.rcParams["font.sans-serif"] = [
+            "Microsoft JhengHei", "SimHei", "PMingLiU", "Noto Sans CJK TC",
+            "Noto Sans CJK SC", "PingFang TC", "PingFang SC", "WenQuanYi Zen Hei"
+        ]
+    plt.rcParams["axes.unicode_minus"] = False
+except Exception:
+    pass  # 即使字型載入失敗，也不阻斷執行
 
 # ---- 嘗試載入 yfinance；失敗仍可用假資料 ----
 try:
