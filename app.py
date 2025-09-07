@@ -1,18 +1,11 @@
 # -*- coding: utf-8 -*-
 # 技術指標面板（MA / 量價 / KD / MACD）+ 多股票對比 + 箱型進出說明 + 依成本計算 + 中文名稱（可顯示簡短）
-# v1.5.4:
-#   - ✅ 恢復「箱型進出價」文字說明（含建議買價/賣價/下限 & 量能過濾訊息）
-#   - ✅ 恢復「依成本計算」區塊（當前損益、停利價、停損價）
-#   - 🛠️ 延續：名稱來源（TWSE codeQuery→ISIN→yfinance）、yfinance Series 真值修正、TWSE/TPEX 備援、
-#             相對表現資料檢查、下載 CSV/Excel、MA/KD/MACD 交叉標註
-# === SPEC: 不能缺少的功能 ===
-# [x] 箱型／成本說明 (box_report, cost_report)
-# [x] MA/KD/MACD 圖與交叉標註
-# [x] 相對表現對比 + 期間切換
-# [x] 下載 CSV/Excel
-# [x] TWSE/TPEX/yfinance 資料備援
-# ===========================
-# 作者: LexLu   日期: 2025-09-07
+# v1.5.7:
+#   - 依 v1.5.4 加入：KD 高位貼齊偵測（70≤K,D<80 且 |K-D|≤閾值，連續≥N天）
+#   - KD 圖上標註：KD 黃金/死亡交叉、續強確認(K 由下穿 80 且量≥量均)、轉弱警訊(K↓D 且 D<70)、高位貼齊陰影
+#   - 側欄新增三項可調參數：啟用偵測 / 連續天數 N / |K-D| 閾值
+#   - 其他功能維持：箱型/成本說明、MA/KD/MACD、相對表現、下載、TWSE/TPEX/yfinance 備援
+# 作者: LexLu   日期: 2025-09-08
 
 import os, io, re, requests
 import streamlit as st
@@ -23,7 +16,7 @@ import matplotlib.dates as mdates
 from datetime import datetime
 
 AUTHOR  = "LexLu"
-VERSION = "v1.5.4 (2025-09-07)"
+VERSION = "v1.5.7 (2025-09-08)"
 YEAR    = datetime.now().year
 
 # ===== 字型 =====
@@ -414,6 +407,20 @@ def detect_cross(x: pd.Series, y: pd.Series):
     gold=(prev<=0)&(now>0); death=(prev>=0)&(now<0)
     return x.index[gold.fillna(False)], x.index[death.fillna(False)]
 
+def segments_from_mask(mask: pd.Series, min_len: int = 3):
+    """把 True 連續區段轉成 [(start,end), ...]（含端點）"""
+    if mask is None or mask.empty: return []
+    m = mask.fillna(False)
+    if not m.any(): return []
+    grp = (m != m.shift()).cumsum()
+    out=[]
+    for _, sub in m.groupby(grp):
+        if not sub.iloc[0]:  # False 段
+            continue
+        if len(sub) >= min_len:
+            out.append((sub.index[0], sub.index[-1]))
+    return out
+
 def make_csv_bytes(df: pd.DataFrame) -> bytes: return df.to_csv(index=True).encode("utf-8-sig")
 def make_excel_bytes(df: pd.DataFrame) -> bytes | None:
     try:
@@ -460,10 +467,10 @@ st.sidebar.title("ℹ️ 功能")
 st.sidebar.markdown(
     "- 移動平均線（可多條）\n"
     "- 量價（含量均）\n"
-    "- KD / MACD（含交叉）\n"
+    "- KD / MACD（含交叉 & 指示）\n"
     "- 多股票相對表現（近1月/3月/半年/YTD）\n"
     "- 下載 CSV/Excel\n"
-    "- 名稱顯示：完整 / 簡短（去 -KY、公司/產業尾綴）\n"
+    "- 名稱顯示：完整 / 簡短\n"
     "- yfinance 斷線 → TWSE/TPEX 備援\n"
 )
 
@@ -494,6 +501,17 @@ with st.form("params"):
         sl_pct = st.number_input("停損門檻（-%）", min_value=0.1, max_value=100.0, value=5.0, step=0.1)
     with c7:
         cost_str = st.text_input("持有成本（可空白）", value="")
+
+    # ==== KD 高位貼齊偵測（新增） ====
+    st.markdown("##### KD 高位貼齊偵測（70–80帶）")
+    d1,d2,d3 = st.columns([1,1,1])
+    with d1:
+        kd_detect_enable = st.checkbox("啟用 KD 貼齊偵測", value=True)
+    with d2:
+        kd_parallel_days = st.number_input("連續天數 N", min_value=2, max_value=20, value=3, step=1)
+    with d3:
+        kd_parallel_eps  = st.number_input("|K-D| 閾值", min_value=0.1, max_value=10.0, value=2.5, step=0.1)
+
     submitted = st.form_submit_button("開始分析")
 
 if not submitted:
@@ -650,11 +668,45 @@ for i,tk in enumerate(tickers):
         ax2.xaxis.set_major_locator(locator); ax2.xaxis.set_major_formatter(formatter)
         fig2.autofmt_xdate(rotation=45); st.pyplot(fig2, clear_figure=True)
 
-        # KD
-        fig3=plt.figure(figsize=(10.8,2.8)); ax3=plt.gca()
-        ax3.plot(dfp.index, dfp["%K"], label="%K"); ax3.plot(dfp.index, dfp["%D"], label="%D")
+        # ===== KD（含：交叉 / 續強 / 轉弱 / 高位貼齊）=====
+        fig3=plt.figure(figsize=(10.8,2.9)); ax3=plt.gca()
+        k = dfp["%K"].astype(float); dline = dfp["%D"].astype(float)
+        ax3.plot(dfp.index, k, label="%K"); ax3.plot(dfp.index, dline, label="%D")
         ax3.axhline(80, linestyle="--", linewidth=1); ax3.axhline(20, linestyle="--", linewidth=1)
-        ax3.legend(); ax3.set_title(f"{title_prefix}｜KD")
+
+        # KD 黃金/死亡交叉
+        gk, dk = detect_cross(k, dline)
+        if len(gk)>0: ax3.scatter(gk, k.loc[gk], marker="^", s=45, label="KD 黃金交叉", zorder=3)
+        if len(dk)>0: ax3.scatter(dk, k.loc[dk], marker="v", s=45, label="KD 死亡交叉", zorder=3)
+
+        # 續強確認：K 由下穿越 80 且 當日量>=量均
+        vol_ok_today = (dfp["VOLUME"] >= dfp["VOL_MA"])
+        cont_mask = (k.shift(1) <= 80) & (k > 80) & vol_ok_today
+        cont_idx = dfp.index[cont_mask.fillna(False)]
+        if len(cont_idx)>0:
+            ax3.scatter(cont_idx, k.loc[cont_idx], marker="o", s=40, label="續強確認(K↑80 & 量達標)", zorder=3)
+
+        # 轉弱警訊：K↓D 且 D<70
+        warn_mask = ((k.shift(1) >= dline.shift(1)) & (k < dline) & (dline < 70))
+        warn_idx = dfp.index[warn_mask.fillna(False)]
+        if len(warn_idx)>0:
+            ax3.scatter(warn_idx, k.loc[warn_idx], marker="x", s=45, label="轉弱警訊(K↓D且D<70)", zorder=3)
+
+        # 高位貼齊（70–80帶）：70 ≤ K,D < 80 且 |K-D| ≤ 閾值，連續 ≥ N 天 → 陰影
+        if kd_detect_enable:
+            in_band_k = k.between(70, 80, inclusive="left")   # [70, 80)
+            in_band_d = dline.between(70, 80, inclusive="left")
+            close_gap = (k.sub(dline).abs() <= float(kd_parallel_eps))
+            parallel_mask = in_band_k & in_band_d & close_gap
+            segs = segments_from_mask(parallel_mask, int(kd_parallel_days))
+            added_label = False
+            for (sdt, edt) in segs:
+                ax3.axvspan(sdt, edt, alpha=0.12, ymin=0, ymax=1,
+                            label=("KD高位貼齊" if not added_label else None))
+                added_label = True
+
+        ax3.legend()
+        ax3.set_title(f"{title_prefix}｜KD")
         ax3.xaxis.set_major_locator(locator); ax3.xaxis.set_major_formatter(formatter)
         fig3.autofmt_xdate(rotation=45); st.pyplot(fig3, clear_figure=True)
 
@@ -670,18 +722,10 @@ for i,tk in enumerate(tickers):
         ax4.xaxis.set_major_locator(locator); ax4.xaxis.set_major_formatter(formatter)
         fig4.autofmt_xdate(rotation=45); st.pyplot(fig4, clear_figure=True)
 
-        # ===== 🔶 箱型進出價 & 依成本計算（回歸！） =====
+        # ===== 箱型進出價 & 依成本計算 =====
         st.markdown("### 箱型 / 成本說明")
         st.text(build_box_report(m, vol_filter))
         st.text(build_cost_report(user_cost, float(tp_pct), float(sl_pct), m["close"]))
-
-        # 交易提示（簡要）
-        st.markdown("### 交易提示（參考）")
-        st.markdown(
-            "- **價格低於 MA**：可觀察逢低 / 分批。\n"
-            "- **價格接近上軌**：留意壓力，分批減碼或設移動停利。\n"
-            "- **量能通過**：放量上攻較佳，若量縮跌破 MA 需謹慎。"
-        )
 
         # 下載報表
         df_export = dfp.tail(int(lookback)).round(6)
